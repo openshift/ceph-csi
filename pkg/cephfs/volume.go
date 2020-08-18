@@ -269,7 +269,7 @@ func purgeVolume(ctx context.Context, volID volumeID, cr *util.Credentials, volO
 	if err != nil {
 		klog.Errorf(util.Log(ctx, "failed to purge subvolume %s(%s) in fs %s"), string(volID), err, volOptions.FsName)
 
-		if strings.HasPrefix(err.Error(), errNotFoundString) {
+		if strings.Contains(err.Error(), errNotFoundString) {
 			return ErrVolumeNotFound{err}
 		}
 

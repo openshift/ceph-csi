@@ -759,6 +759,12 @@ func (cs *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi
 		return nil, status.Error(codes.InvalidArgument, "capacityRange cannot be empty")
 	}
 
+	nodeExpansion := false
+	// Get the nodeexpansion flag set based on the volume mode
+	if req.GetVolumeCapability().GetBlock() == nil {
+		nodeExpansion = true
+	}
+
 	// lock out parallel requests against the same volume ID
 	if acquired := cs.VolumeLocks.TryAcquire(volID); !acquired {
 		klog.Errorf(util.Log(ctx, util.VolumeOperationAlreadyExistsFmt), volID)
@@ -797,11 +803,9 @@ func (cs *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi
 	volSize := util.RoundOffBytes(req.GetCapacityRange().GetRequiredBytes())
 
 	// resize volume if required
-	nodeExpansion := false
 	if rbdVol.VolSize < volSize {
 		klog.V(4).Infof(util.Log(ctx, "rbd volume %s/%s size is %v,resizing to %v"), rbdVol.Pool, rbdVol.RbdImageName, rbdVol.VolSize, volSize)
 		rbdVol.VolSize = volSize
-		nodeExpansion = true
 		err = resizeRBDImage(rbdVol, cr)
 		if err != nil {
 			klog.Errorf(util.Log(ctx, "failed to resize rbd image: %s/%s with error: %v"), rbdVol.Pool, rbdVol.RbdImageName, err)

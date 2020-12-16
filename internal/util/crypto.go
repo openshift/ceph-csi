@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"path"
 	"strings"
 
@@ -46,11 +47,20 @@ const (
 	// Passphrase size - 20 bytes is 160 bits to satisfy:
 	// https://tools.ietf.org/html/rfc6749#section-10.10
 	encryptionPassphraseSize = 20
+	// podNamespace ENV should be set in the cephcsi container
+	podNamespace = "POD_NAMESPACE"
+
+	// kmsConfigMapName env to read a ConfigMap by name
+	kmsConfigMapName = "KMS_CONFIGMAP_NAME"
+
+	// defaultConfigMapToRead default ConfigMap name to fetch kms connection details
+	defaultConfigMapToRead = "csi-kms-connection-details"
 )
 
 // EncryptionKMS provides external Key Management System for encryption
 // passphrases storage.
 type EncryptionKMS interface {
+	Destroy()
 	GetPassphrase(key string) (string, error)
 	SavePassphrase(key, value string) error
 	DeletePassphrase(key string) error
@@ -75,6 +85,11 @@ func initSecretsKMS(secrets map[string]string) (EncryptionKMS, error) {
 	return SecretsKMS{passphrase: passphraseValue}, nil
 }
 
+// Destroy frees all used resources.
+func (kms SecretsKMS) Destroy() {
+	// nothing to do
+}
+
 // GetPassphrase returns passphrase from Kubernetes secrets.
 func (kms SecretsKMS) GetPassphrase(key string) (string, error) {
 	return kms.passphrase, nil
@@ -97,35 +112,49 @@ func (kms SecretsKMS) GetID() string {
 }
 
 // GetKMS returns an instance of Key Management System.
-func GetKMS(kmsID string, secrets map[string]string) (EncryptionKMS, error) {
+//
+// - tenant is the owner of the Volume, used to fetch the Vault Token from the
+//   Kubernetes Namespace where the PVC lives
+// - kmsID is the service name of the KMS configuration
+// - secrets contain additional details, like TLS certificates to connect to
+//   the KMS
+func GetKMS(tenant, kmsID string, secrets map[string]string) (EncryptionKMS, error) {
 	if kmsID == "" || kmsID == defaultKMSType {
 		return initSecretsKMS(secrets)
 	}
-
+	var config map[string]interface{}
 	// #nosec
 	content, err := ioutil.ReadFile(kmsConfigPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read kms configuration from %s: %s",
-			kmsConfigPath, err)
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("failed to read kms configuration from %s: %w",
+				kmsConfigPath, err)
+		}
+		// If the configmap is not mounted to the CSI pods read the configmap
+		// the kubernetes.
+		namespace := os.Getenv(podNamespace)
+		if namespace != "" {
+			return nil, fmt.Errorf("%q is not set", podNamespace)
+		}
+		name := os.Getenv(kmsConfigMapName)
+		if name != "" {
+			name = defaultConfigMapToRead
+		}
+		config, err = getVaultConfiguration(namespace, name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read kms configuration from configmap %s in namespace %s: %w",
+				namespace, name, err)
+		}
 	}
 
-	var config map[string]interface{}
 	err = json.Unmarshal(content, &config)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse kms configuration: %s", err)
+		return nil, fmt.Errorf("failed to parse kms configuration: %w", err)
 	}
 
-	kmsConfigData, ok := config[kmsID].(map[string]interface{})
+	kmsConfig, ok := config[kmsID].(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("missing encryption KMS configuration with %s", kmsID)
-	}
-	kmsConfig := make(map[string]string)
-	for key, value := range kmsConfigData {
-		kmsConfig[key], ok = value.(string)
-		if !ok {
-			return nil, fmt.Errorf("broken KMS config: '%s' for '%s' is not a string",
-				value, key)
-		}
 	}
 
 	kmsType, ok := kmsConfig[kmsTypeKey]
@@ -133,8 +162,11 @@ func GetKMS(kmsID string, secrets map[string]string) (EncryptionKMS, error) {
 		return nil, fmt.Errorf("encryption KMS configuration for %s is missing KMS type", kmsID)
 	}
 
-	if kmsType == "vault" {
+	switch kmsType {
+	case kmsTypeVault:
 		return InitVaultKMS(kmsID, kmsConfig, secrets)
+	case kmsTypeVaultTokens:
+		return InitVaultTokensKMS(tenant, kmsID, kmsConfig)
 	}
 	return nil, fmt.Errorf("unknown encryption KMS type %s", kmsType)
 }

@@ -105,7 +105,9 @@ type rbdVolume struct {
 	readOnly            bool
 	Primary             bool
 	KMS                 util.EncryptionKMS
-	CreatedAt           *timestamp.Timestamp
+	// Owner is the creator (tenant, Kubernetes Namespace) of the volume.
+	Owner     string
+	CreatedAt *timestamp.Timestamp
 	// conn is a connection to the Ceph cluster obtained from a ConnPool
 	conn *util.ClusterConnection
 	// an opened IOContext, call .openIoctx() before using
@@ -166,6 +168,9 @@ func (rv *rbdVolume) Destroy() {
 	}
 	if rv.conn != nil {
 		rv.conn.Destroy()
+	}
+	if rv.KMS != nil {
+		rv.KMS.Destroy()
 	}
 }
 
@@ -734,10 +739,11 @@ func genVolFromVolID(ctx context.Context, volumeID string, cr *util.Credentials,
 	rbdVol.RbdImageName = imageAttributes.ImageName
 	rbdVol.ReservedID = vi.ObjectUUID
 	rbdVol.ImageID = imageAttributes.ImageID
+	rbdVol.Owner = imageAttributes.Owner
 
 	if imageAttributes.KmsID != "" {
 		rbdVol.Encrypted = true
-		rbdVol.KMS, err = util.GetKMS(imageAttributes.KmsID, secrets)
+		rbdVol.KMS, err = util.GetKMS(rbdVol.Owner, imageAttributes.KmsID, secrets)
 		if err != nil {
 			return rbdVol, err
 		}
@@ -813,6 +819,15 @@ func genVolFromVolumeOptions(ctx context.Context, volOptions, credentials map[st
 		rbdVol.Mounter = rbdDefaultMounter
 	}
 
+	// if the KMS is of type VaultToken, additional metadata is needed
+	// depending on the tenant, the KMS can be configured with other
+	// options
+	// FIXME: this works only on Kubernetes, how do other CO supply metadata?
+	rbdVol.Owner, ok = volOptions["csi.storage.k8s.io/pvc/namespace"]
+	if !ok {
+		util.DebugLog(ctx, "could not detect owner for %s", rbdVol.String())
+	}
+
 	rbdVol.Encrypted = false
 	encrypted, ok = volOptions["encrypted"]
 	if ok {
@@ -826,7 +841,7 @@ func genVolFromVolumeOptions(ctx context.Context, volOptions, credentials map[st
 			// deliberately ignore if parsing failed as GetKMS will return default
 			// implementation of kmsID is empty
 			kmsID := volOptions["encryptionKMSID"]
-			rbdVol.KMS, err = util.GetKMS(kmsID, credentials)
+			rbdVol.KMS, err = util.GetKMS(rbdVol.Owner, kmsID, credentials)
 			if err != nil {
 				return nil, fmt.Errorf("invalid encryption kms configuration: %s", err)
 			}

@@ -53,6 +53,7 @@ spec:
             - "--feature-gates=Topology=false"
             # if fstype is not specified in storageclass, ext4 is default
             - "--default-fstype=ext4"
+            - "--extra-create-metadata=true"
           env:
             - name: ADDRESS
               value: unix:///csi/csi-provisioner.sock
@@ -132,6 +133,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # - name: POD_NAMESPACE
+            #   valueFrom:
+            #     fieldRef:
+            #       fieldPath: spec.namespace
+            # - name: KMS_CONFIGMAP_NAME
+            #   value: encryptionConfig
             - name: CSI_ENDPOINT
               value: unix:///csi/csi-provisioner.sock
           imagePullPolicy: "IfNotPresent"

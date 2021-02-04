@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/hashicorp/vault/api"
 	loss "github.com/libopenstorage/secrets"
@@ -74,7 +75,7 @@ type vaultTokenConf struct {
 	VaultClientCertFromSecret    string `json:"vaultClientCertFromSecret"`
 	VaultClientCertKeyFromSecret string `json:"vaultClientCertKeyFromSecret"`
 	VaultNamespace               string `json:"vaultNamespace"`
-	VaultCAVerify                bool   `json:"vaultCAVerify"`
+	VaultCAVerify                string `json:"vaultCAVerify"`
 }
 
 func (v *vaultTokenConf) convertStdVaultToCSIConfig(s *standardVault) {
@@ -89,9 +90,9 @@ func (v *vaultTokenConf) convertStdVaultToCSIConfig(s *standardVault) {
 
 	// by default the CA should get verified, only when VaultSkipVerify is
 	// set, verification should be disabled
-	v.VaultCAVerify = true
+	v.VaultCAVerify = "true"
 	if s.VaultSkipVerify != nil {
-		v.VaultCAVerify = *s.VaultSkipVerify
+		v.VaultCAVerify = strconv.FormatBool(*s.VaultSkipVerify)
 	}
 }
 
@@ -172,6 +173,7 @@ type VaultTokensKMS struct {
 // InitVaultTokensKMS returns an interface to HashiCorp Vault KMS.
 func InitVaultTokensKMS(tenant, kmsID string, config map[string]interface{}) (EncryptionKMS, error) {
 	kms := &VaultTokensKMS{}
+	kms.Tenant = tenant
 	err := kms.initConnection(kmsID, config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize Vault connection: %w", err)
@@ -268,14 +270,14 @@ func (kms *VaultTokensKMS) initCertificates(config map[string]interface{}) error
 	}
 	// ignore errConfigOptionMissing, no default was set
 	if vaultCAFromSecret != "" {
-		cert, cErr := getCertificate(kms.Tenant, vaultCAFromSecret, "ca.cert")
-		if cErr != nil && !apierrs.IsNotFound(err) {
+		cert, cErr := getCertificate(kms.Tenant, vaultCAFromSecret, "cert")
+		if cErr != nil && !apierrs.IsNotFound(cErr) {
 			return fmt.Errorf("failed to get CA certificate from secret %s: %w", vaultCAFromSecret, cErr)
 		}
 		// if the certificate is not present in tenant namespace get it from
 		// cephcsi pod namespace
 		if apierrs.IsNotFound(cErr) {
-			cert, cErr = getCertificate(csiNamespace, vaultCAFromSecret, "ca.cert")
+			cert, cErr = getCertificate(csiNamespace, vaultCAFromSecret, "cert")
 			if cErr != nil {
 				return fmt.Errorf("failed to get CA certificate from secret %s: %w", vaultCAFromSecret, cErr)
 			}
@@ -293,14 +295,14 @@ func (kms *VaultTokensKMS) initCertificates(config map[string]interface{}) error
 	}
 	// ignore errConfigOptionMissing, no default was set
 	if vaultClientCertFromSecret != "" {
-		cert, cErr := getCertificate(kms.Tenant, vaultClientCertFromSecret, "tls.cert")
+		cert, cErr := getCertificate(kms.Tenant, vaultClientCertFromSecret, "cert")
 		if cErr != nil && !apierrs.IsNotFound(cErr) {
 			return fmt.Errorf("failed to get client certificate from secret %s: %w", vaultClientCertFromSecret, cErr)
 		}
 		// if the certificate is not present in tenant namespace get it from
 		// cephcsi pod namespace
 		if apierrs.IsNotFound(cErr) {
-			cert, cErr = getCertificate(csiNamespace, vaultClientCertFromSecret, "tls.cert")
+			cert, cErr = getCertificate(csiNamespace, vaultClientCertFromSecret, "cert")
 			if cErr != nil {
 				return fmt.Errorf("failed to get client certificate from secret %s: %w", vaultCAFromSecret, cErr)
 			}
@@ -319,14 +321,14 @@ func (kms *VaultTokensKMS) initCertificates(config map[string]interface{}) error
 
 	// ignore errConfigOptionMissing, no default was set
 	if vaultClientCertKeyFromSecret != "" {
-		certKey, err := getCertificate(kms.Tenant, vaultClientCertKeyFromSecret, "tls.key")
+		certKey, err := getCertificate(kms.Tenant, vaultClientCertKeyFromSecret, "key")
 		if err != nil && !apierrs.IsNotFound(err) {
 			return fmt.Errorf("failed to get client certificate key from secret %s: %w", vaultClientCertKeyFromSecret, err)
 		}
 		// if the certificate is not present in tenant namespace get it from
 		// cephcsi pod namespace
 		if apierrs.IsNotFound(err) {
-			certKey, err = getCertificate(csiNamespace, vaultClientCertFromSecret, "tls.key")
+			certKey, err = getCertificate(csiNamespace, vaultClientCertKeyFromSecret, "key")
 			if err != nil {
 				return fmt.Errorf("failed to get client certificate key from secret %s: %w", vaultCAFromSecret, err)
 			}

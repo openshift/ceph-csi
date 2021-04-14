@@ -125,7 +125,7 @@ func checkContentSource(ctx context.Context, req *csi.CreateVolumeRequest, cr *u
 }
 
 // CreateVolume creates a reservation and the volume in backend, if it is not already present.
-// nolint:gocognit:gocyclo // TODO: reduce complexity
+// nolint:gocognit,gocyclo,nestif // TODO: reduce complexity
 func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	if err := cs.validateCreateVolumeRequest(req); err != nil {
 		util.ErrorLog(ctx, "CreateVolumeRequest validation failed: %v", err)
@@ -193,7 +193,6 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 					// All errors other than ErrVolumeNotFound should return an error back to the caller
 					if !errors.Is(purgeErr, ErrVolumeNotFound) {
 						return nil, status.Error(codes.Internal, purgeErr.Error())
-
 					}
 				}
 				errUndo := undoVolReservation(ctx, volOptions, *vID, secret)
@@ -689,20 +688,18 @@ func (cs *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteS
 
 	volOpt, snapInfo, sid, err := newSnapshotOptionsFromID(ctx, snapshotID, cr)
 	if err != nil {
-		// if error is ErrPoolNotFound, the pool is already deleted we dont
-		// need to worry about deleting snapshot or omap data, return success
-		if errors.Is(err, util.ErrPoolNotFound) {
+		switch {
+		case errors.Is(err, util.ErrPoolNotFound):
+			// if error is ErrPoolNotFound, the pool is already deleted we dont
+			// need to worry about deleting snapshot or omap data, return success
 			util.WarningLog(ctx, "failed to get backend snapshot for %s: %v", snapshotID, err)
 			return &csi.DeleteSnapshotResponse{}, nil
-		}
-
-		// if error is ErrKeyNotFound, then a previous attempt at deletion was complete
-		// or partially complete (snap and snapOMap are garbage collected already), hence return
-		// success as deletion is complete
-		if errors.Is(err, util.ErrKeyNotFound) {
+		case errors.Is(err, util.ErrKeyNotFound):
+			// if error is ErrKeyNotFound, then a previous attempt at deletion was complete
+			// or partially complete (snap and snapOMap are garbage collected already), hence return
+			// success as deletion is complete
 			return &csi.DeleteSnapshotResponse{}, nil
-		}
-		if errors.Is(err, ErrSnapNotFound) {
+		case errors.Is(err, ErrSnapNotFound):
 			err = undoSnapReservation(ctx, volOpt, *sid, sid.FsSnapshotName, cr)
 			if err != nil {
 				util.ErrorLog(ctx, "failed to remove reservation for snapname (%s) with backing snap (%s) (%s)",
@@ -710,10 +707,9 @@ func (cs *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteS
 				return nil, status.Error(codes.Internal, err.Error())
 			}
 			return &csi.DeleteSnapshotResponse{}, nil
-		}
-		// if the error is ErrVolumeNotFound, the subvolume is already deleted
-		// from backend, Hence undo the omap entries and return success
-		if errors.Is(err, ErrVolumeNotFound) {
+		case errors.Is(err, ErrVolumeNotFound):
+			// if the error is ErrVolumeNotFound, the subvolume is already deleted
+			// from backend, Hence undo the omap entries and return success
 			util.ErrorLog(ctx, "Volume not present")
 			err = undoSnapReservation(ctx, volOpt, *sid, sid.FsSnapshotName, cr)
 			if err != nil {
@@ -722,8 +718,9 @@ func (cs *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteS
 				return nil, status.Error(codes.Internal, err.Error())
 			}
 			return &csi.DeleteSnapshotResponse{}, nil
+		default:
+			return nil, status.Error(codes.Internal, err.Error())
 		}
-		return nil, status.Error(codes.Internal, err.Error())
 	}
 	defer volOpt.Destroy()
 

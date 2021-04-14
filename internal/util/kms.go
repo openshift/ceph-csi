@@ -35,14 +35,15 @@ const (
 	// options.
 	kmsTypeKey = "encryptionKMSType"
 
-	// podNamespace ENV should be set in the cephcsi container
-	podNamespace = "POD_NAMESPACE"
+	// podNamespaceEnv ENV should be set in the cephcsi container
+	podNamespaceEnv = "POD_NAMESPACE"
 
-	// kmsConfigMapName env to read a ConfigMap by name
-	kmsConfigMapName = "KMS_CONFIGMAP_NAME"
+	// kmsConfigMapEnv env to read a ConfigMap by name
+	kmsConfigMapEnv = "KMS_CONFIGMAP_NAME"
 
-	// defaultConfigMapToRead default ConfigMap name to fetch kms connection details
-	defaultConfigMapToRead = "csi-kms-connection-details"
+	// defaultKMSConfigMapName default ConfigMap name to fetch kms
+	// connection details
+	defaultKMSConfigMapName = "csi-kms-connection-details"
 )
 
 // GetKMS returns an instance of Key Management System.
@@ -66,7 +67,7 @@ func GetKMS(tenant, kmsID string, secrets map[string]string) (EncryptionKMS, err
 	section, ok := config[kmsID]
 	if !ok {
 		return nil, fmt.Errorf("could not get KMS configuration "+
-			"for %q", kmsID)
+			"for %q (have %v)", kmsID, getKeys(config))
 	}
 
 	// kmsConfig can have additional sub-sections
@@ -112,19 +113,38 @@ func getKMSConfiguration() (map[string]interface{}, error) {
 	return config, nil
 }
 
+// getPodNamespace reads the `podNamespaceEnv` from the environment and returns
+// its value. In case the namespace can not be detected, an error is returned.
+func getPodNamespace() (string, error) {
+	ns := os.Getenv(podNamespaceEnv)
+	if ns == "" {
+		return "", fmt.Errorf("%q is not set in the environment",
+			podNamespaceEnv)
+	}
+
+	return ns, nil
+}
+
+// getKMSConfigMapName reads the `kmsConfigMapEnv` from the environment, or
+// returns the value of `defaultKMSConfigMapName` if it was not set.
+func getKMSConfigMapName() string {
+	cmName := os.Getenv(kmsConfigMapEnv)
+	if cmName == "" {
+		cmName = defaultKMSConfigMapName
+	}
+
+	return cmName
+}
+
 // getKMSConfigMap returns the contents of the ConfigMap.
 //
 // FIXME: Ceph-CSI should not talk to Kubernetes directly.
 func getKMSConfigMap() (map[string]interface{}, error) {
-	ns := os.Getenv(podNamespace)
-	if ns == "" {
-		return nil, fmt.Errorf("%q is not set in the environment",
-			podNamespace)
+	ns, err := getPodNamespace()
+	if err != nil {
+		return nil, err
 	}
-	cmName := os.Getenv(kmsConfigMapName)
-	if cmName == "" {
-		cmName = defaultConfigMapToRead
-	}
+	cmName := getKMSConfigMapName()
 
 	c := NewK8sClient()
 	cm, err := c.CoreV1().ConfigMaps(ns).Get(context.Background(),
@@ -135,9 +155,9 @@ func getKMSConfigMap() (map[string]interface{}, error) {
 
 	// convert cm.Data from map[string]interface{}
 	kmsConfig := make(map[string]interface{})
-	for kmsID, data := range cm.BinaryData {
+	for kmsID, data := range cm.Data {
 		section := make(map[string]interface{})
-		err = json.Unmarshal(data, &section)
+		err = json.Unmarshal([]byte(data), &section)
 		if err != nil {
 			return nil, fmt.Errorf("could not convert contents "+
 				"of %q to s config section", kmsID)
@@ -184,6 +204,10 @@ type KMSInitializerArgs struct {
 	Tenant  string
 	Config  map[string]interface{}
 	Secrets map[string]string
+	// Namespace contains the Kubernetes Namespace where the Ceph-CSI Pods
+	// are running. This is an optional option, and might be unset when the
+	// KMSProvider.Initializer is called.
+	Namespace string
 }
 
 // KMSInitializerFunc gets called when the KMSProvider needs to be
@@ -240,9 +264,18 @@ func (kf *kmsProviderList) buildKMS(tenant string, config map[string]interface{}
 			providerName)
 	}
 
-	return provider.Initializer(KMSInitializerArgs{
+	kmsInitArgs := KMSInitializerArgs{
 		Tenant:  tenant,
 		Config:  config,
 		Secrets: secrets,
-	})
+	}
+
+	// Namespace is an optional parameter, it may not be set and is not
+	// required for all KMSProviders
+	ns, err := getPodNamespace()
+	if err == nil {
+		kmsInitArgs.Namespace = ns
+	}
+
+	return provider.Initializer(kmsInitArgs)
 }

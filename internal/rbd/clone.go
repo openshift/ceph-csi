@@ -46,7 +46,10 @@ import (
 func (rv *rbdVolume) checkCloneImage(ctx context.Context, parentVol *rbdVolume) (bool, error) {
 	// generate temp cloned volume
 	tempClone := rv.generateTempClone()
+	defer tempClone.Destroy()
+
 	snap := &rbdSnapshot{}
+	defer snap.Destroy()
 	snap.RbdSnapName = rv.RbdImageName
 	snap.Pool = rv.Pool
 
@@ -74,7 +77,8 @@ func (rv *rbdVolume) checkCloneImage(ctx context.Context, parentVol *rbdVolume) 
 
 	err = tempClone.checkSnapExists(snap)
 	if err != nil {
-		if errors.Is(err, ErrSnapNotFound) {
+		switch {
+		case errors.Is(err, ErrSnapNotFound):
 			// check temporary image needs flatten, if yes add task to flatten the
 			// temporary clone
 			err = tempClone.flattenRbdImage(ctx, rv.conn.Creds, false, rbdHardMaxCloneDepth, rbdSoftMaxCloneDepth)
@@ -88,7 +92,7 @@ func (rv *rbdVolume) checkCloneImage(ctx context.Context, parentVol *rbdVolume) 
 				return false, err
 			}
 			return true, nil
-		} else if !errors.Is(err, ErrImageNotFound) {
+		case !errors.Is(err, ErrImageNotFound):
 			// any error other than image not found return error
 			return false, err
 		}
@@ -116,7 +120,7 @@ func (rv *rbdVolume) checkCloneImage(ctx context.Context, parentVol *rbdVolume) 
 	err = parentVol.checkSnapExists(snap)
 	if err == nil {
 		// the temp clone exists, delete it lets reserve a new ID and
-		// create new resources for clearner approach
+		// create new resources for a cleaner approach
 		err = parentVol.deleteSnapshot(ctx, snap)
 	}
 	if errors.Is(err, ErrSnapNotFound) {
@@ -213,6 +217,12 @@ func (rv *rbdVolume) createCloneFromImage(ctx context.Context, parentVol *rbdVol
 		return err
 	}
 
+	if parentVol.isEncrypted() {
+		err = parentVol.copyEncryptionConfig(&rv.rbdImage)
+		if err != nil {
+			return fmt.Errorf("failed to copy encryption config for %q: %w", rv, err)
+		}
+	}
 	err = j.StoreImageID(ctx, rv.JournalPool, rv.ReservedID, rv.ImageID)
 	if err != nil {
 		util.ErrorLog(ctx, "failed to store volume %s: %v", rv, err)

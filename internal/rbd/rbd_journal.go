@@ -25,6 +25,15 @@ import (
 	"github.com/ceph/ceph-csi/internal/util"
 )
 
+const (
+	// PVVolumeHandleAnnotationKey is the annotation key set on the PV object.
+	PVVolumeHandleAnnotationKey = "csi.ceph.io/volume-handle"
+	// PVReplicatedLabelKey is the label key set on PV object.
+	PVReplicatedLabelKey = "csi.ceph.io/replicated-volume"
+	// PVReplicatedLabelValue is the label value set on PV object.
+	PVReplicatedLabelValue = "volume-handle-detected"
+)
+
 func validateNonEmptyField(field, fieldName, structName string) error {
 	if field == "" {
 		return fmt.Errorf("value '%s' in '%s' structure cannot be empty", fieldName, structName)
@@ -277,10 +286,10 @@ func (rv *rbdVolume) Exists(ctx context.Context, parentVol *rbdVolume) (bool, er
 			// Need to check cloned info here not on createvolume,
 			if parentVol != nil {
 				found, cErr := rv.checkCloneImage(ctx, parentVol)
-				if found && cErr == nil {
+				switch {
+				case found && cErr == nil:
 					return true, nil
-				}
-				if cErr != nil {
+				case cErr != nil:
 					return false, cErr
 				}
 			}
@@ -291,17 +300,9 @@ func (rv *rbdVolume) Exists(ctx context.Context, parentVol *rbdVolume) (bool, er
 		return false, err
 	}
 
-	if rv.ImageID == "" {
-		err = rv.getImageID()
-		if err != nil {
-			util.ErrorLog(ctx, "failed to get image id %s: %v", rv, err)
-			return false, err
-		}
-		err = j.StoreImageID(ctx, rv.JournalPool, rv.ReservedID, rv.ImageID)
-		if err != nil {
-			util.ErrorLog(ctx, "failed to store volume id %s: %v", rv, err)
-			return false, err
-		}
+	err = rv.repairImageID(ctx, j)
+	if err != nil {
+		return false, err
 	}
 
 	// size checks
@@ -318,10 +319,40 @@ func (rv *rbdVolume) Exists(ctx context.Context, parentVol *rbdVolume) (bool, er
 		return false, err
 	}
 
+	if parentVol != nil && parentVol.isEncrypted() {
+		err = parentVol.copyEncryptionConfig(&rv.rbdImage)
+		if err != nil {
+			util.ErrorLog(ctx, err.Error())
+			return false, err
+		}
+	}
+
 	util.DebugLog(ctx, "found existing volume (%s) with image name (%s) for request (%s)",
 		rv.VolID, rv.RbdImageName, rv.RequestName)
 
 	return true, nil
+}
+
+// repairImageID checks if rv.ImageID is already available (if so, it was
+// fetched from the journal), in case it is missing, the imageID is obtained
+// and stored in the journal.
+func (rv *rbdVolume) repairImageID(ctx context.Context, j *journal.Connection) error {
+	if rv.ImageID != "" {
+		return nil
+	}
+
+	err := rv.getImageID()
+	if err != nil {
+		util.ErrorLog(ctx, "failed to get image id %s: %v", rv, err)
+		return err
+	}
+	err = j.StoreImageID(ctx, rv.JournalPool, rv.ReservedID, rv.ImageID)
+	if err != nil {
+		util.ErrorLog(ctx, "failed to store volume id %s: %v", rv, err)
+		return err
+	}
+
+	return nil
 }
 
 // reserveSnap is a helper routine to request a rbdSnapshot name reservation and generate the
@@ -342,9 +373,14 @@ func reserveSnap(ctx context.Context, rbdSnap *rbdSnapshot, rbdVol *rbdVolume, c
 	}
 	defer j.Destroy()
 
+	kmsID := ""
+	if rbdVol.isEncrypted() {
+		kmsID = rbdVol.encryption.GetID()
+	}
+
 	rbdSnap.ReservedID, rbdSnap.RbdSnapName, err = j.ReserveName(
 		ctx, rbdSnap.JournalPool, journalPoolID, rbdSnap.Pool, imagePoolID,
-		rbdSnap.RequestName, rbdSnap.NamePrefix, rbdVol.RbdImageName, "", rbdSnap.ReservedID, rbdVol.Owner)
+		rbdSnap.RequestName, rbdSnap.NamePrefix, rbdVol.RbdImageName, kmsID, rbdSnap.ReservedID, rbdVol.Owner)
 	if err != nil {
 		return err
 	}
@@ -479,10 +515,9 @@ func undoVolReservation(ctx context.Context, rbdVol *rbdVolume, cr *util.Credent
 // Extract uuid from volumeID
 // Reserve omap data
 // Generate new volume Handler
-// Create old volumeHandler to new handler mapping
 // The volume handler won't remain same as its contains poolID,clusterID etc
 // which are not same across clusters.
-func RegenerateJournal(imageName, volumeID, pool, journalPool, requestName string, cr *util.Credentials) error {
+func RegenerateJournal(imageName, volumeID, pool, journalPool, requestName string, cr *util.Credentials) (string, error) {
 	ctx := context.Background()
 	var (
 		options map[string]string
@@ -496,7 +531,7 @@ func RegenerateJournal(imageName, volumeID, pool, journalPool, requestName strin
 
 	err := vi.DecomposeCSIID(rbdVol.VolID)
 	if err != nil {
-		return fmt.Errorf("%w: error decoding volume ID (%s) (%s)",
+		return "", fmt.Errorf("%w: error decoding volume ID (%s) (%s)",
 			ErrInvalidVolID, err, rbdVol.VolID)
 	}
 
@@ -507,13 +542,13 @@ func RegenerateJournal(imageName, volumeID, pool, journalPool, requestName strin
 	rbdVol.Monitors, _, err = util.GetMonsAndClusterID(options)
 	if err != nil {
 		util.ErrorLog(ctx, "failed getting mons (%s)", err)
-		return err
+		return "", err
 	}
 
 	rbdVol.Pool = pool
 	err = rbdVol.Connect(cr)
 	if err != nil {
-		return err
+		return "", err
 	}
 	rbdVol.JournalPool = journalPool
 	if rbdVol.JournalPool == "" {
@@ -522,13 +557,13 @@ func RegenerateJournal(imageName, volumeID, pool, journalPool, requestName strin
 	volJournal = journal.NewCSIVolumeJournal("default")
 	j, err := volJournal.Connect(rbdVol.Monitors, rbdVol.RadosNamespace, cr)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer j.Destroy()
 
 	journalPoolID, imagePoolID, err := util.GetPoolIDs(ctx, rbdVol.Monitors, rbdVol.JournalPool, rbdVol.Pool, cr)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	rbdVol.RequestName = requestName
@@ -538,7 +573,7 @@ func RegenerateJournal(imageName, volumeID, pool, journalPool, requestName strin
 	imageData, err := j.CheckReservation(
 		ctx, rbdVol.JournalPool, rbdVol.RequestName, rbdVol.NamePrefix, "", kmsID)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if imageData != nil {
 		rbdVol.ReservedID = imageData.ImageUUID
@@ -547,23 +582,23 @@ func RegenerateJournal(imageName, volumeID, pool, journalPool, requestName strin
 		if rbdVol.ImageID == "" {
 			err = rbdVol.storeImageID(ctx, j)
 			if err != nil {
-				return err
+				return "", err
 			}
 		}
-		err = rbdVol.addNewUUIDMapping(ctx, imagePoolID, j)
-		if err != nil {
-			util.ErrorLog(ctx, "failed to add UUID mapping %s: %v", rbdVol, err)
-			return err
-		}
 		// As the omap already exists for this image ID return nil.
-		return nil
+		rbdVol.VolID, err = util.GenerateVolID(ctx, rbdVol.Monitors, cr, imagePoolID, rbdVol.Pool,
+			rbdVol.ClusterID, rbdVol.ReservedID, volIDVersion)
+		if err != nil {
+			return "", err
+		}
+		return rbdVol.VolID, nil
 	}
 
 	rbdVol.ReservedID, rbdVol.RbdImageName, err = j.ReserveName(
 		ctx, rbdVol.JournalPool, journalPoolID, rbdVol.Pool, imagePoolID,
 		rbdVol.RequestName, rbdVol.NamePrefix, "", kmsID, vi.ObjectUUID, rbdVol.Owner)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	defer func() {
@@ -578,7 +613,7 @@ func RegenerateJournal(imageName, volumeID, pool, journalPool, requestName strin
 	rbdVol.VolID, err = util.GenerateVolID(ctx, rbdVol.Monitors, cr, imagePoolID, rbdVol.Pool,
 		rbdVol.ClusterID, rbdVol.ReservedID, volIDVersion)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	util.DebugLog(ctx, "re-generated Volume ID (%s) and image name (%s) for request name (%s)",
@@ -586,14 +621,11 @@ func RegenerateJournal(imageName, volumeID, pool, journalPool, requestName strin
 	if rbdVol.ImageID == "" {
 		err = rbdVol.storeImageID(ctx, j)
 		if err != nil {
-			return err
+			return "", err
 		}
 	}
 
-	if volumeID != rbdVol.VolID {
-		return j.ReserveNewUUIDMapping(ctx, rbdVol.JournalPool, volumeID, rbdVol.VolID)
-	}
-	return nil
+	return rbdVol.VolID, nil
 }
 
 // storeImageID retrieves the image ID and stores it in OMAP.
@@ -609,24 +641,4 @@ func (rv *rbdVolume) storeImageID(ctx context.Context, j *journal.Connection) er
 		return err
 	}
 	return nil
-}
-
-// addNewUUIDMapping creates the mapping between two volumeID.
-func (rv *rbdVolume) addNewUUIDMapping(ctx context.Context, imagePoolID int64, j *journal.Connection) error {
-	var err error
-	volID := ""
-
-	id, err := j.CheckNewUUIDMapping(ctx, rv.JournalPool, rv.VolID)
-	if err == nil && id == "" {
-		volID, err = util.GenerateVolID(ctx, rv.Monitors, rv.conn.Creds, imagePoolID, rv.Pool,
-			rv.ClusterID, rv.ReservedID, volIDVersion)
-		if err != nil {
-			return err
-		}
-		if rv.VolID == volID {
-			return nil
-		}
-		return j.ReserveNewUUIDMapping(ctx, rv.JournalPool, rv.VolID, volID)
-	}
-	return err
 }

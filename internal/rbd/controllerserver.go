@@ -28,7 +28,6 @@ import (
 
 	librbd "github.com/ceph/go-ceph/rbd"
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/kube-storage/spec/lib/go/replication"
 	"github.com/kubernetes-csi/csi-lib-utils/protosanitizer"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -42,11 +41,6 @@ const (
 // controller server spec.
 type ControllerServer struct {
 	*csicommon.DefaultControllerServer
-	// added UnimplementedControllerServer as a member of
-	// ControllerServer. if replication spec add more RPC services in the proto
-	// file, then we don't need to add all RPC methods leading to forward
-	// compatibility.
-	*replication.UnimplementedControllerServer
 	// A map storing all volumes with ongoing operations so that additional operations
 	// for that same volume (as defined by VolumeID/volume name) return an Aborted error
 	VolumeLocks *util.VolumeLocks
@@ -158,15 +152,7 @@ func (cs *ControllerServer) parseVolCreateRequest(ctx context.Context, req *csi.
 	return rbdVol, nil
 }
 
-func buildCreateVolumeResponse(ctx context.Context, req *csi.CreateVolumeRequest, rbdVol *rbdVolume) (*csi.CreateVolumeResponse, error) {
-	if rbdVol.isEncrypted() {
-		err := rbdVol.setupEncryption(ctx)
-		if err != nil {
-			util.ErrorLog(ctx, err.Error())
-			return nil, status.Error(codes.Internal, err.Error())
-		}
-	}
-
+func buildCreateVolumeResponse(req *csi.CreateVolumeRequest, rbdVol *rbdVolume) *csi.CreateVolumeResponse {
 	volumeContext := req.GetParameters()
 	volumeContext["pool"] = rbdVol.Pool
 	volumeContext["journalPool"] = rbdVol.JournalPool
@@ -188,7 +174,7 @@ func buildCreateVolumeResponse(ctx context.Context, req *csi.CreateVolumeRequest
 				},
 			}
 	}
-	return &csi.CreateVolumeResponse{Volume: volume}, nil
+	return &csi.CreateVolumeResponse{Volume: volume}
 }
 
 // getGRPCErrorForCreateVolume converts the returns the GRPC errors based on
@@ -272,6 +258,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	if err != nil {
 		return nil, getGRPCErrorForCreateVolume(err)
 	}
+
 	if found {
 		if rbdSnap != nil {
 			// check if image depth is reached limit and requires flatten
@@ -279,8 +266,14 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 			if err != nil {
 				return nil, err
 			}
+
+			err = rbdSnap.repairEncryptionConfig(&rbdVol.rbdImage)
+			if err != nil {
+				return nil, err
+			}
 		}
-		return buildCreateVolumeResponse(ctx, req, rbdVol)
+
+		return buildCreateVolumeResponse(req, rbdVol), nil
 	}
 
 	err = validateRequestedVolumeSize(rbdVol, parentVol, rbdSnap, cr)
@@ -308,7 +301,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		}
 	}()
 
-	err = cs.createBackingImage(ctx, cr, rbdVol, parentVol, rbdSnap)
+	err = cs.createBackingImage(ctx, cr, req.GetSecrets(), rbdVol, parentVol, rbdSnap)
 	if err != nil {
 		if errors.Is(err, ErrFlattenInProgress) {
 			return nil, status.Error(codes.Aborted, err.Error())
@@ -316,26 +309,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return nil, err
 	}
 
-	volumeContext := req.GetParameters()
-	volumeContext["pool"] = rbdVol.Pool
-	volumeContext["journalPool"] = rbdVol.JournalPool
-	volumeContext["radosNamespace"] = rbdVol.RadosNamespace
-	volumeContext["imageName"] = rbdVol.RbdImageName
-	volume := &csi.Volume{
-		VolumeId:      rbdVol.VolID,
-		CapacityBytes: rbdVol.VolSize,
-		VolumeContext: volumeContext,
-		ContentSource: req.GetVolumeContentSource(),
-	}
-	if rbdVol.Topology != nil {
-		volume.AccessibleTopology =
-			[]*csi.Topology{
-				{
-					Segments: rbdVol.Topology,
-				},
-			}
-	}
-	return &csi.CreateVolumeResponse{Volume: volume}, nil
+	return buildCreateVolumeResponse(req, rbdVol), nil
 }
 
 func flattenParentImage(ctx context.Context, rbdVol *rbdVolume, cr *util.Credentials) error {
@@ -431,7 +405,7 @@ func checkFlatten(ctx context.Context, rbdVol *rbdVolume, cr *util.Credentials) 
 	return nil
 }
 
-func (cs *ControllerServer) createVolumeFromSnapshot(ctx context.Context, cr *util.Credentials, rbdVol *rbdVolume, snapshotID string) error {
+func (cs *ControllerServer) createVolumeFromSnapshot(ctx context.Context, cr *util.Credentials, secrets map[string]string, rbdVol *rbdVolume, snapshotID string) error {
 	rbdSnap := &rbdSnapshot{}
 	if acquired := cs.SnapshotLocks.TryAcquire(snapshotID); !acquired {
 		util.ErrorLog(ctx, util.SnapshotOperationAlreadyExistsFmt, snapshotID)
@@ -439,7 +413,7 @@ func (cs *ControllerServer) createVolumeFromSnapshot(ctx context.Context, cr *ut
 	}
 	defer cs.SnapshotLocks.Release(snapshotID)
 
-	err := genSnapFromSnapID(ctx, rbdSnap, snapshotID, cr)
+	err := genSnapFromSnapID(ctx, rbdSnap, snapshotID, cr, secrets)
 	if err != nil {
 		if errors.Is(err, util.ErrPoolNotFound) {
 			util.ErrorLog(ctx, "failed to get backend snapshot for %s: %v", snapshotID, err)
@@ -453,7 +427,7 @@ func (cs *ControllerServer) createVolumeFromSnapshot(ctx context.Context, cr *ut
 	// create clone image and delete snapshot
 	err = rbdVol.cloneRbdImageFromSnapshot(ctx, rbdSnap)
 	if err != nil {
-		util.ErrorLog(ctx, "failed to clone rbd image %s from snapshot %s: %v", rbdSnap, err)
+		util.ErrorLog(ctx, "failed to clone rbd image %s from snapshot %s: %v", rbdVol, rbdSnap, err)
 		return err
 	}
 
@@ -461,7 +435,7 @@ func (cs *ControllerServer) createVolumeFromSnapshot(ctx context.Context, cr *ut
 	return nil
 }
 
-func (cs *ControllerServer) createBackingImage(ctx context.Context, cr *util.Credentials, rbdVol, parentVol *rbdVolume, rbdSnap *rbdSnapshot) error {
+func (cs *ControllerServer) createBackingImage(ctx context.Context, cr *util.Credentials, secrets map[string]string, rbdVol, parentVol *rbdVolume, rbdSnap *rbdSnapshot) error {
 	var err error
 
 	var j = &journal.Connection{}
@@ -479,7 +453,7 @@ func (cs *ControllerServer) createBackingImage(ctx context.Context, cr *util.Cre
 		}
 		defer cs.OperationLocks.ReleaseRestoreLock(rbdSnap.VolID)
 
-		err = cs.createVolumeFromSnapshot(ctx, cr, rbdVol, rbdSnap.VolID)
+		err = cs.createVolumeFromSnapshot(ctx, cr, secrets, rbdVol, rbdSnap.VolID)
 		if err != nil {
 			return err
 		}
@@ -522,13 +496,6 @@ func (cs *ControllerServer) createBackingImage(ctx context.Context, cr *util.Cre
 			return err
 		}
 	}
-	if rbdVol.isEncrypted() {
-		err = rbdVol.setupEncryption(ctx)
-		if err != nil {
-			util.ErrorLog(ctx, "failed to setup encroption for image %s: %v", rbdVol, err)
-			return status.Error(codes.Internal, err.Error())
-		}
-	}
 	return nil
 }
 
@@ -548,7 +515,7 @@ func checkContentSource(ctx context.Context, req *csi.CreateVolumeRequest, cr *u
 			return nil, nil, status.Errorf(codes.NotFound, "volume Snapshot ID cannot be empty")
 		}
 		rbdSnap := &rbdSnapshot{}
-		if err := genSnapFromSnapID(ctx, rbdSnap, snapshotID, cr); err != nil {
+		if err := genSnapFromSnapID(ctx, rbdSnap, snapshotID, cr, req.GetSecrets()); err != nil {
 			util.ErrorLog(ctx, "failed to get backend snapshot for %s: %v", snapshotID, err)
 			if !errors.Is(err, ErrSnapNotFound) {
 				return nil, nil, status.Error(codes.Internal, err.Error())
@@ -565,8 +532,7 @@ func checkContentSource(ctx context.Context, req *csi.CreateVolumeRequest, cr *u
 		if volID == "" {
 			return nil, nil, status.Errorf(codes.NotFound, "volume ID cannot be empty")
 		}
-		// TODO need to support cloning for encrypted volume
-		rbdvol, err := genVolFromVolID(ctx, volID, cr, nil)
+		rbdvol, err := genVolFromVolID(ctx, volID, cr, req.GetSecrets())
 		if err != nil {
 			util.ErrorLog(ctx, "failed to get backend image for %s: %v", volID, err)
 			if !errors.Is(err, ErrImageNotFound) {
@@ -696,12 +662,6 @@ func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	if rbdVol.isEncrypted() {
-		if err = rbdVol.encryption.RemoveDEK(rbdVol.VolID); err != nil {
-			util.WarningLog(ctx, "failed to clean the passphrase for volume %s: %s", rbdVol.VolID, err)
-		}
-	}
-
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
@@ -728,10 +688,7 @@ func (cs *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req 
 	}, nil
 }
 
-// CreateSnapshot creates the snapshot in backend and stores metadata
-// in store
-// TODO: make this function less complex
-// nolint:gocyclo // complexity needs to be reduced.
+// CreateSnapshot creates the snapshot in backend and stores metadata in store.
 func (cs *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
 	if err := cs.validateSnapshotReq(ctx, req); err != nil {
 		return nil, err
@@ -758,12 +715,6 @@ func (cs *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 			err = status.Errorf(codes.Internal, err.Error())
 		}
 		return nil, err
-	}
-
-	// TODO: re-encrypt snapshot with a new passphrase
-	if rbdVol.isEncrypted() {
-		return nil, status.Errorf(codes.Unimplemented, "source Volume %s is encrypted, "+
-			"snapshotting is not supported currently", rbdVol.VolID)
 	}
 
 	// Check if source volume was created with required image features for snaps
@@ -803,46 +754,7 @@ func (cs *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 		return nil, status.Errorf(codes.Internal, err.Error())
 	}
 	if found {
-		vol := generateVolFromSnap(rbdSnap)
-		err = vol.Connect(cr)
-		if err != nil {
-			uErr := undoSnapshotCloning(ctx, vol, rbdSnap, vol, cr)
-			if uErr != nil {
-				util.WarningLog(ctx, "failed undoing reservation of snapshot: %s %v", req.GetName(), uErr)
-			}
-			return nil, status.Errorf(codes.Internal, err.Error())
-		}
-		defer vol.Destroy()
-
-		err = vol.flattenRbdImage(ctx, cr, false, rbdHardMaxCloneDepth, rbdSoftMaxCloneDepth)
-		if errors.Is(err, ErrFlattenInProgress) {
-			return &csi.CreateSnapshotResponse{
-				Snapshot: &csi.Snapshot{
-					SizeBytes:      rbdSnap.SizeBytes,
-					SnapshotId:     rbdSnap.VolID,
-					SourceVolumeId: rbdSnap.SourceVolumeID,
-					CreationTime:   rbdSnap.CreatedAt,
-					ReadyToUse:     false,
-				},
-			}, nil
-		}
-		if err != nil {
-			uErr := undoSnapshotCloning(ctx, vol, rbdSnap, vol, cr)
-			if uErr != nil {
-				util.WarningLog(ctx, "failed undoing reservation of snapshot: %s %v", req.GetName(), uErr)
-			}
-			return nil, status.Errorf(codes.Internal, err.Error())
-		}
-
-		return &csi.CreateSnapshotResponse{
-			Snapshot: &csi.Snapshot{
-				SizeBytes:      rbdSnap.SizeBytes,
-				SnapshotId:     rbdSnap.VolID,
-				SourceVolumeId: rbdSnap.SourceVolumeID,
-				CreationTime:   rbdSnap.CreatedAt,
-				ReadyToUse:     true,
-			},
-		}, nil
+		return cloneFromSnapshot(ctx, rbdVol, rbdSnap, cr)
 	}
 
 	err = flattenTemporaryClonedImages(ctx, rbdVol, cr)
@@ -878,6 +790,58 @@ func (cs *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 			SourceVolumeId: req.GetSourceVolumeId(),
 			CreationTime:   vol.CreatedAt,
 			ReadyToUse:     ready,
+		},
+	}, nil
+}
+
+// cloneFromSnapshot is a helper for CreateSnapshot that continues creating an
+// RBD image from an RBD snapshot if the process was interrupted at one point.
+func cloneFromSnapshot(ctx context.Context, rbdVol *rbdVolume, rbdSnap *rbdSnapshot, cr *util.Credentials) (*csi.CreateSnapshotResponse, error) {
+	vol := generateVolFromSnap(rbdSnap)
+	err := vol.Connect(cr)
+	if err != nil {
+		uErr := undoSnapshotCloning(ctx, vol, rbdSnap, vol, cr)
+		if uErr != nil {
+			util.WarningLog(ctx, "failed undoing reservation of snapshot: %s %v", rbdSnap.RequestName, uErr)
+		}
+		return nil, status.Errorf(codes.Internal, err.Error())
+	}
+	defer vol.Destroy()
+
+	if rbdVol.isEncrypted() {
+		// FIXME: vol.VolID should be different from rbdVol.VolID
+		vol.VolID = rbdVol.VolID
+		cryptErr := rbdVol.copyEncryptionConfig(&vol.rbdImage)
+		if cryptErr != nil {
+			util.WarningLog(ctx, "failed copy encryption "+
+				"config for %q: %v", vol.String(),
+				rbdSnap.RequestName, cryptErr)
+			return nil, status.Errorf(codes.Internal,
+				err.Error())
+		}
+	}
+
+	// if flattening is not needed, the snapshot is ready for use
+	readyToUse := true
+
+	err = vol.flattenRbdImage(ctx, cr, false, rbdHardMaxCloneDepth, rbdSoftMaxCloneDepth)
+	if errors.Is(err, ErrFlattenInProgress) {
+		readyToUse = false
+	} else if err != nil {
+		uErr := undoSnapshotCloning(ctx, vol, rbdSnap, vol, cr)
+		if uErr != nil {
+			util.WarningLog(ctx, "failed undoing reservation of snapshot: %s %v", rbdSnap.RequestName, uErr)
+		}
+		return nil, status.Errorf(codes.Internal, err.Error())
+	}
+
+	return &csi.CreateSnapshotResponse{
+		Snapshot: &csi.Snapshot{
+			SizeBytes:      rbdSnap.SizeBytes,
+			SnapshotId:     rbdSnap.VolID,
+			SourceVolumeId: rbdSnap.SourceVolumeID,
+			CreationTime:   rbdSnap.CreatedAt,
+			ReadyToUse:     readyToUse,
 		},
 	}, nil
 }
@@ -935,6 +899,16 @@ func (cs *ControllerServer) doSnapshotClone(ctx context.Context, parentVol *rbdV
 			}
 		}
 	}()
+
+	if parentVol.isEncrypted() {
+		cryptErr := parentVol.copyEncryptionConfig(&cloneRbd.rbdImage)
+		if cryptErr != nil {
+			util.WarningLog(ctx, "failed copy encryption "+
+				"config for %q: %v", cloneRbd.String(), cryptErr)
+			return ready, nil, status.Errorf(codes.Internal,
+				err.Error())
+		}
+	}
 
 	err = cloneRbd.createSnapshot(ctx, rbdSnap)
 	if err != nil {
@@ -1008,7 +982,7 @@ func (cs *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteS
 	defer cs.OperationLocks.ReleaseDeleteLock(snapshotID)
 
 	rbdSnap := &rbdSnapshot{}
-	if err = genSnapFromSnapID(ctx, rbdSnap, snapshotID, cr); err != nil {
+	if err = genSnapFromSnapID(ctx, rbdSnap, snapshotID, cr, req.GetSecrets()); err != nil {
 		// if error is ErrPoolNotFound, the pool is already deleted we dont
 		// need to worry about deleting snapshot or omap data, return success
 		if errors.Is(err, util.ErrPoolNotFound) {

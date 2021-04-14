@@ -111,6 +111,71 @@ func (ri *rbdImage) setupEncryption(ctx context.Context) error {
 	return nil
 }
 
+// copyEncryptionConfig copies the VolumeEncryption object from the source
+// rbdImage to the passed argument. This function re-encrypts the passphrase
+// from the original, so that both encrypted passphrases (potentially, depends
+// on the DEKStore) have different contents.
+func (ri *rbdImage) copyEncryptionConfig(cp *rbdImage) error {
+	if ri.VolID == cp.VolID {
+		return fmt.Errorf("BUG: %q and %q have the same VolID (%s) "+
+			"set!? Call stack: %s", ri, cp, ri.VolID, util.CallStack())
+	}
+
+	// get the unencrypted passphrase
+	passphrase, err := ri.encryption.GetCryptoPassphrase(ri.VolID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch passphrase for %q: %w",
+			ri.String(), err)
+	}
+
+	cp.encryption, err = util.NewVolumeEncryption(ri.encryption.GetID(), ri.encryption.KMS)
+	if errors.Is(err, util.ErrDEKStoreNeeded) {
+		cp.encryption.SetDEKStore(cp)
+	}
+
+	// re-encrypt the plain passphrase for the cloned volume
+	err = cp.encryption.StoreCryptoPassphrase(cp.VolID, passphrase)
+	if err != nil {
+		return fmt.Errorf("failed to store passphrase for %q: %w",
+			cp.String(), err)
+	}
+
+	// copy encryption status for the original volume
+	status, err := ri.checkRbdImageEncrypted(context.TODO())
+	if err != nil {
+		return fmt.Errorf("failed to get encryption status for %q: %w",
+			ri.String(), err)
+	}
+	err = cp.ensureEncryptionMetadataSet(status)
+	if err != nil {
+		return fmt.Errorf("failed to store encryption status for %q: "+
+			"%w", cp.String(), err)
+	}
+
+	return nil
+}
+
+// repairEncryptionConfig checks the encryption state of the current rbdImage,
+// and makes sure that the destination rbdImage has the same configuration.
+func (ri *rbdImage) repairEncryptionConfig(dest *rbdImage) error {
+	if !ri.isEncrypted() {
+		return nil
+	}
+
+	// if ri is encrypted, copy its configuration in case it is missing
+	if !dest.isEncrypted() {
+		// dest needs to be connected to the cluster, otherwise it will
+		// not be possible to write any metadata
+		if dest.conn == nil {
+			dest.conn = ri.conn.Copy()
+		}
+
+		return ri.copyEncryptionConfig(dest)
+	}
+
+	return nil
+}
+
 func (ri *rbdImage) encryptDevice(ctx context.Context, devicePath string) error {
 	passphrase, err := ri.encryption.GetCryptoPassphrase(ri.VolID)
 	if err != nil {
@@ -221,8 +286,12 @@ func (ri *rbdImage) configureEncryption(kmsID string, credentials map[string]str
 
 // StoreDEK saves the DEK in the metadata, overwrites any existing contents.
 func (ri *rbdImage) StoreDEK(volumeID, dek string) error {
-	if ri.VolID != volumeID {
-		return fmt.Errorf("volume %q can not store DEK for %q", ri.String(), volumeID)
+	if ri.VolID == "" {
+		return fmt.Errorf("BUG: %q does not have VolID set, call "+
+			"stack: %s", ri, util.CallStack())
+	} else if ri.VolID != volumeID {
+		return fmt.Errorf("volume %q can not store DEK for %q",
+			ri.String(), volumeID)
 	}
 
 	return ri.SetMetadata(metadataDEK, dek)
@@ -230,7 +299,10 @@ func (ri *rbdImage) StoreDEK(volumeID, dek string) error {
 
 // FetchDEK reads the DEK from the image metadata.
 func (ri *rbdImage) FetchDEK(volumeID string) (string, error) {
-	if ri.VolID != volumeID {
+	if ri.VolID == "" {
+		return "", fmt.Errorf("BUG: %q does not have VolID set, call "+
+			"stack: %s", ri, util.CallStack())
+	} else if ri.VolID != volumeID {
 		return "", fmt.Errorf("volume %q can not fetch DEK for %q", ri.String(), volumeID)
 	}
 
@@ -240,8 +312,12 @@ func (ri *rbdImage) FetchDEK(volumeID string) (string, error) {
 // RemoveDEK does not need to remove the DEK from the metadata, the image is
 // most likely getting removed.
 func (ri *rbdImage) RemoveDEK(volumeID string) error {
-	if ri.VolID != volumeID {
-		return fmt.Errorf("volume %q can not remove DEK for %q", ri.String(), volumeID)
+	if ri.VolID == "" {
+		return fmt.Errorf("BUG: %q does not have VolID set, call "+
+			"stack: %s", ri, util.CallStack())
+	} else if ri.VolID != volumeID {
+		return fmt.Errorf("volume %q can not remove DEK for %q",
+			ri.String(), volumeID)
 	}
 
 	return nil

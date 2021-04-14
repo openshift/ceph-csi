@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -318,4 +319,27 @@ func contains(s []string, key string) bool {
 	}
 
 	return false
+}
+
+// getKeys takes a map that uses strings for keys and returns a slice with the
+// keys.
+func getKeys(m map[string]interface{}) []string {
+	keys := make([]string, len(m))
+
+	i := 0
+	for k := range m {
+		keys[i] = k
+		i++
+	}
+
+	return keys
+}
+
+// CallStack returns the stack of the calls in the current goroutine. Useful
+// for debugging or reporting errors. This is a friendly alternative to
+// assert() or panic().
+func CallStack() string {
+	stack := make([]byte, 2048)
+	_ = runtime.Stack(stack, false)
+	return string(stack)
 }

@@ -130,17 +130,6 @@ function disable_storage_addons() {
     ${minikube} addons disable storage-provisioner 2>/dev/null || true
 }
 
-# minikube has the Busybox losetup, and that does not work with raw-block PVCs.
-# Copy the host losetup executable and hope it works.
-#
-# See https://github.com/kubernetes/minikube/issues/8284
-function minikube_losetup() {
-    # scp should not ask for any confirmation
-    scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i "$(${minikube} ssh-key)" /sbin/losetup docker@"$(${minikube} ip)":losetup
-    # replace /sbin/losetup symlink with the executable
-    ${minikube} ssh 'sudo sh -c "rm -f /sbin/losetup && cp ~docker/losetup /sbin"'
-}
-
 function minikube_supports_psp() {
     local MINIKUBE_MAJOR
     local MINIKUBE_MINOR
@@ -173,7 +162,7 @@ if [[ "${VM_DRIVER}" == "kvm2" ]]; then
 fi
 
 #feature-gates for kube
-K8S_FEATURE_GATES=${K8S_FEATURE_GATES:-"BlockVolume=true,CSIBlockVolume=true,VolumeSnapshotDataSource=true,ExpandCSIVolumes=true"}
+K8S_FEATURE_GATES=${K8S_FEATURE_GATES:-"ExpandCSIVolumes=true"}
 
 #extra-config for kube https://minikube.sigs.k8s.io/docs/reference/configuration/kubernetes/
 EXTRA_CONFIG=${EXTRA_CONFIG:-"--extra-config=apiserver.enable-admission-plugins=PodSecurityPolicy"}
@@ -234,7 +223,6 @@ up)
         wait_for_ssh
         # shellcheck disable=SC2086
         ${minikube} ssh "sudo mkdir -p /mnt/${DISK}/var/lib/rook;sudo ln -s /mnt/${DISK}/var/lib/rook /var/lib/rook"
-        minikube_losetup
     fi
     ${minikube} kubectl -- cluster-info
     ;;

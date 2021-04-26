@@ -74,11 +74,11 @@ type rbdImage struct {
 	VolID string `json:"volID"`
 
 	Monitors string
-	// JournalPool is the ceph pool in which the CSI snapshot Journal is
+	// JournalPool is the ceph pool in which the CSI Journal/CSI snapshot Journal is
 	// stored
 	JournalPool string
-	// Pool is where the image snapshot journal and snapshot is stored, and
-	// could be the same as `JournalPool` (retained as Pool instead of
+	// Pool is where the image journal/image snapshot journal and image/snapshot
+	// is stored, and could be the same as `JournalPool` (retained as Pool instead of
 	// renaming to ImagePool or such, as this is referenced in the code
 	// extensively)
 	Pool           string
@@ -439,10 +439,11 @@ func (rv *rbdVolume) isInUse() (bool, error) {
 	// because we opened the image, there is at least one watcher
 	defaultWatchers := 1
 	if rv.Primary {
-		// a watcher will be added by the rbd mirror daemon if the image is primary
+		// if rbd mirror daemon is running, a watcher will be added by the rbd
+		// mirror daemon for mirrored images.
 		defaultWatchers++
 	}
-	return len(watchers) != defaultWatchers, nil
+	return len(watchers) > defaultWatchers, nil
 }
 
 // addRbdManagerTask adds a ceph manager task to execute command
@@ -872,7 +873,6 @@ func generateVolumeFromVolumeID(ctx context.Context, volumeID string, cr *util.C
 	if err != nil {
 		return rbdVol, err
 	}
-
 	rbdVol.RequestName = imageAttributes.RequestName
 	rbdVol.RbdImageName = imageAttributes.ImageName
 	rbdVol.ReservedID = vi.ObjectUUID
@@ -908,7 +908,7 @@ func generateVolumeFromVolumeID(ctx context.Context, volumeID string, cr *util.C
 // the structure with elements from on-disk image metadata as well.
 func genVolFromVolID(ctx context.Context, volumeID string, cr *util.Credentials, secrets map[string]string) (*rbdVolume, error) {
 	vol, err := generateVolumeFromVolumeID(ctx, volumeID, cr, secrets)
-	if !errors.Is(err, util.ErrKeyNotFound) && !errors.Is(err, util.ErrPoolNotFound) {
+	if !errors.Is(err, util.ErrKeyNotFound) && !errors.Is(err, util.ErrPoolNotFound) && !errors.Is(err, ErrImageNotFound) {
 		return vol, err
 	}
 

@@ -28,7 +28,6 @@ push_helm_charts() {
 	mkdir -p "$CHARTDIR/csi-charts/docs/$PACKAGE"
 	cp -R "./charts/ceph-csi-$PACKAGE" "$CHARTDIR/csi-charts/docs/$PACKAGE"
 	pushd "$CHARTDIR/csi-charts/docs/$PACKAGE" >/dev/null
-	helm init --client-only
 	helm package "ceph-csi-$PACKAGE"
 	popd >/dev/null
 
@@ -105,7 +104,7 @@ if [ "${TRAVIS_PULL_REQUEST}" == "false" ]; then
 
 	pushd "$CSI_CHARTS_DIR" >/dev/null
 
-	curl -L https://git.io/get_helm.sh | bash
+	curl -L https://git.io/get_helm.sh | bash -s -- --version "${HELM_VERSION}"
 
 	build_step "cloning ceph/csi-charts repository"
 	git clone https://github.com/ceph/csi-charts

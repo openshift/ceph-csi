@@ -238,6 +238,7 @@ func (ns *NodeServer) stageTransaction(ctx context.Context, req *csi.NodeStageVo
 	var err error
 	var readOnly bool
 	var feature bool
+	var depth uint
 
 	var cr *util.Credentials
 	cr, err = util.NewUserCredentials(req.GetSecrets())
@@ -272,7 +273,11 @@ func (ns *NodeServer) stageTransaction(ctx context.Context, req *csi.NodeStageVo
 		if err != nil {
 			return transaction, err
 		}
-		if feature {
+		depth, err = volOptions.getCloneDepth(ctx)
+		if err != nil {
+			return transaction, err
+		}
+		if feature || depth != 0 {
 			err = volOptions.flattenRbdImage(ctx, cr, true, rbdHardMaxCloneDepth, rbdSoftMaxCloneDepth)
 			if err != nil {
 				return transaction, err
@@ -362,6 +367,7 @@ func (ns *NodeServer) undoStagingTransaction(ctx context.Context, req *csi.NodeS
 
 func (ns *NodeServer) createStageMountPoint(ctx context.Context, mountPath string, isBlock bool) error {
 	if isBlock {
+		// #nosec:G304, intentionally creating file mountPath, not a security issue
 		pathFile, err := os.OpenFile(mountPath, os.O_CREATE|os.O_RDWR, 0600)
 		if err != nil {
 			util.ErrorLog(ctx, "failed to create mountPath:%s with error: %v", mountPath, err)

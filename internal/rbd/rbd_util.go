@@ -719,7 +719,14 @@ func (rv *rbdVolume) checkImageChainHasFeature(ctx context.Context, feature uint
 		}
 		err = vol.getImageInfo()
 		if err != nil {
-			util.ErrorLog(ctx, "failed to get image info for %s: %s", vol, err)
+			// call to getImageInfo returns the parent name even if the parent
+			// is in the trash, when we try to open the parent image to get its
+			// information it fails because it is already in trash. We should
+			// treat error as nil if the parent is not found.
+			if errors.Is(err, ErrImageNotFound) {
+				return false, nil
+			}
+			util.ErrorLog(ctx, "failed to get image info for %s: %s", vol.String(), err)
 			return false, err
 		}
 		if f := vol.hasFeature(feature); f {

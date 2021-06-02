@@ -19,7 +19,6 @@ package rbd
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strconv"
 
 	csicommon "github.com/ceph/ceph-csi/internal/csi-common"
@@ -118,13 +117,7 @@ func (cs *ControllerServer) parseVolCreateRequest(ctx context.Context, req *csi.
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	tp := "thickProvision"
-	thick := req.GetParameters()[tp]
-	if thick != "" {
-		if rbdVol.ThickProvision, err = strconv.ParseBool(thick); err != nil {
-			return nil, fmt.Errorf("failed to parse %q: %w", tp, err)
-		}
-	}
+	rbdVol.ThickProvision = cs.isThickProvisionRequest(req)
 
 	rbdVol.RequestName = req.GetName()
 
@@ -257,23 +250,8 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	found, err := rbdVol.Exists(ctx, parentVol)
 	if err != nil {
 		return nil, getGRPCErrorForCreateVolume(err)
-	}
-
-	if found {
-		if rbdSnap != nil {
-			// check if image depth is reached limit and requires flatten
-			err = checkFlatten(ctx, rbdVol, cr)
-			if err != nil {
-				return nil, err
-			}
-
-			err = rbdSnap.repairEncryptionConfig(&rbdVol.rbdImage)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		return buildCreateVolumeResponse(req, rbdVol), nil
+	} else if found {
+		return cs.repairExistingVolume(ctx, req, cr, rbdVol, rbdSnap)
 	}
 
 	err = validateRequestedVolumeSize(rbdVol, parentVol, rbdSnap, cr)
@@ -330,6 +308,47 @@ func flattenParentImage(ctx context.Context, rbdVol *rbdVolume, cr *util.Credent
 		}
 	}
 	return nil
+}
+
+// repairExistingVolume checks the existing volume or snapshot and makes sure
+// that the state is corrected to what was requested. It is needed to call this
+// when the process of creating a volume was interrupted.
+func (cs *ControllerServer) repairExistingVolume(ctx context.Context, req *csi.CreateVolumeRequest,
+	cr *util.Credentials, rbdVol *rbdVolume, rbdSnap *rbdSnapshot) (*csi.CreateVolumeResponse, error) {
+	vcs := req.GetVolumeContentSource()
+
+	switch {
+	// normal CreateVolume without VolumeContentSource
+	case vcs == nil:
+		// continue/restart allocating the volume in case it
+		// should be thick-provisioned
+		if cs.isThickProvisionRequest(req) {
+			err := rbdVol.RepairThickProvision()
+			if err != nil {
+				return nil, status.Error(codes.Internal, err.Error())
+			}
+		}
+
+	// rbdVol is a restore from snapshot, rbdSnap is passed
+	case vcs.GetSnapshot() != nil:
+		// restore from snapshot imploes rbdSnap != nil
+		// check if image depth is reached limit and requires flatten
+		err := checkFlatten(ctx, rbdVol, cr)
+		if err != nil {
+			return nil, err
+		}
+
+		err = rbdSnap.repairEncryptionConfig(&rbdVol.rbdImage)
+		if err != nil {
+			return nil, err
+		}
+
+	// rbdVol is a clone from an other volume
+	case vcs.GetVolume() != nil:
+		// TODO: is there really nothing to repair on image clone?
+	}
+
+	return buildCreateVolumeResponse(req, rbdVol), nil
 }
 
 // check snapshots on the rbd image, as we have limit from krbd that an image
@@ -900,7 +919,7 @@ func (cs *ControllerServer) doSnapshotClone(ctx context.Context, parentVol *rbdV
 		cryptErr := parentVol.copyEncryptionConfig(&cloneRbd.rbdImage)
 		if cryptErr != nil {
 			util.WarningLog(ctx, "failed copy encryption "+
-				"config for %q: %v", cloneRbd.String(), cryptErr)
+				"config for %q: %v", cloneRbd, cryptErr)
 			return ready, nil, status.Errorf(codes.Internal,
 				err.Error())
 		}
@@ -1122,4 +1141,22 @@ func (cs *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi
 		CapacityBytes:         rbdVol.VolSize,
 		NodeExpansionRequired: nodeExpansion,
 	}, nil
+}
+
+// isThickProvisionRequest returns true in case the request contains the
+// `thickProvision` option set to `true`.
+func (cs *ControllerServer) isThickProvisionRequest(req *csi.CreateVolumeRequest) bool {
+	tp := "thickProvision"
+
+	thick, ok := req.GetParameters()[tp]
+	if !ok || thick == "" {
+		return false
+	}
+
+	thickBool, err := strconv.ParseBool(thick)
+	if err != nil {
+		return false
+	}
+
+	return thickBool
 }

@@ -210,6 +210,27 @@ func validateRequestedVolumeSize(rbdVol, parentVol *rbdVolume, rbdSnap *rbdSnaps
 	return nil
 }
 
+func checkValidCreateVolumeRequest(rbdVol, parentVol *rbdVolume, rbdSnap *rbdSnapshot, cr *util.Credentials) error {
+	err := validateRequestedVolumeSize(rbdVol, parentVol, rbdSnap, cr)
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case rbdSnap != nil:
+		err = rbdSnap.isCompatibleEncryption(&rbdVol.rbdImage)
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "cannot restore from snapshot %s: %s", rbdSnap, err.Error())
+		}
+	case parentVol != nil:
+		err = parentVol.isCompatibleEncryption(&rbdVol.rbdImage)
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "cannot clone from volume %s: %s", parentVol, err.Error())
+		}
+	}
+	return nil
+}
+
 // CreateVolume creates the volume in backend.
 func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	if err := cs.validateVolumeReq(ctx, req); err != nil {
@@ -254,7 +275,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return cs.repairExistingVolume(ctx, req, cr, rbdVol, rbdSnap)
 	}
 
-	err = validateRequestedVolumeSize(rbdVol, parentVol, rbdSnap, cr)
+	err = checkValidCreateVolumeRequest(rbdVol, parentVol, rbdSnap, cr)
 	if err != nil {
 		return nil, err
 	}
@@ -443,8 +464,12 @@ func (cs *ControllerServer) createVolumeFromSnapshot(ctx context.Context, cr *ut
 
 	// update parent name(rbd image name in snapshot)
 	rbdSnap.RbdImageName = rbdSnap.RbdSnapName
+	parentVol := generateVolFromSnap(rbdSnap)
+	// as we are operating on single cluster reuse the connection
+	parentVol.conn = rbdVol.conn.Copy()
+
 	// create clone image and delete snapshot
-	err = rbdVol.cloneRbdImageFromSnapshot(ctx, rbdSnap)
+	err = rbdVol.cloneRbdImageFromSnapshot(ctx, rbdSnap, parentVol)
 	if err != nil {
 		util.ErrorLog(ctx, "failed to clone rbd image %s from snapshot %s: %v", rbdVol, rbdSnap, err)
 		return err
@@ -566,8 +591,7 @@ func checkContentSource(ctx context.Context, req *csi.CreateVolumeRequest, cr *u
 
 // DeleteVolume deletes the volume in backend and removes the volume metadata
 // from store
-// TODO: make this function less complex
-// nolint:gocyclo // golangci-lint did not catch this earlier, needs to get fixed later
+// TODO: make this function less complex.
 func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
 	if err := cs.Driver.ValidateControllerServiceRequest(csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME); err != nil {
 		util.ErrorLog(ctx, "invalid delete volume req: %v", protosanitizer.StripSecrets(req))
@@ -794,7 +818,7 @@ func (cs *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateS
 		}
 	}()
 
-	ready := false
+	var ready bool
 	var vol = new(rbdVolume)
 
 	ready, vol, err = cs.doSnapshotClone(ctx, rbdVol, rbdSnap, cr)
@@ -819,7 +843,7 @@ func cloneFromSnapshot(ctx context.Context, rbdVol *rbdVolume, rbdSnap *rbdSnaps
 	vol := generateVolFromSnap(rbdSnap)
 	err := vol.Connect(cr)
 	if err != nil {
-		uErr := undoSnapshotCloning(ctx, vol, rbdSnap, vol, cr)
+		uErr := undoSnapshotCloning(ctx, rbdVol, rbdSnap, vol, cr)
 		if uErr != nil {
 			util.WarningLog(ctx, "failed undoing reservation of snapshot: %s %v", rbdSnap.RequestName, uErr)
 		}
@@ -843,7 +867,7 @@ func cloneFromSnapshot(ctx context.Context, rbdVol *rbdVolume, rbdSnap *rbdSnaps
 	if errors.Is(err, ErrFlattenInProgress) {
 		readyToUse = false
 	} else if err != nil {
-		uErr := undoSnapshotCloning(ctx, vol, rbdSnap, vol, cr)
+		uErr := undoSnapshotCloning(ctx, rbdVol, rbdSnap, vol, cr)
 		if uErr != nil {
 			util.WarningLog(ctx, "failed undoing reservation of snapshot: %s %v", rbdSnap.RequestName, uErr)
 		}
@@ -879,7 +903,9 @@ func (cs *ControllerServer) validateSnapshotReq(ctx context.Context, req *csi.Cr
 	if value, ok := options["snapshotNamePrefix"]; ok && value == "" {
 		return status.Error(codes.InvalidArgument, "empty snapshot name prefix to provision snapshot from")
 	}
-
+	if value, ok := options["pool"]; ok && value == "" {
+		return status.Error(codes.InvalidArgument, "empty pool name in which rbd image will be created")
+	}
 	return nil
 }
 

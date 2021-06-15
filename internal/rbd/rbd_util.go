@@ -108,14 +108,16 @@ type rbdVolume struct {
 	rbdImage
 
 	// VolName and MonValueFromSecret are retained from older plugin versions (<= 1.0.0)
-	//   for backward compatibility reasons
+	// for backward compatibility reasons
 	TopologyPools       *[]util.TopologyConstrainedPool
 	TopologyRequirement *csi.TopologyRequirement
 	Topology            map[string]string
 	// DataPool is where the data for images in `Pool` are stored, this is used as the `--data-pool`
-	// 	 argument when the pool is created, and is not used anywhere else
-	DataPool           string
-	ParentName         string
+	// argument when the pool is created, and is not used anywhere else
+	DataPool   string
+	ParentName string
+	// Parent Pool is the pool that contains the parent image.
+	ParentPool         string
 	imageFeatureSet    librbd.FeatureSet
 	AdminID            string `json:"adminId"`
 	UserID             string `json:"userId"`
@@ -530,23 +532,26 @@ func deleteImage(ctx context.Context, pOpts *rbdVolume, cr *util.Credentials) er
 func (rv *rbdVolume) getCloneDepth(ctx context.Context) (uint, error) {
 	var depth uint
 	vol := rbdVolume{}
-	defer vol.Destroy()
 
 	vol.Pool = rv.Pool
 	vol.Monitors = rv.Monitors
 	vol.RbdImageName = rv.RbdImageName
 	vol.conn = rv.conn.Copy()
 
-	err := vol.openIoctx()
-	if err != nil {
-		return depth, err
-	}
-
 	for {
 		if vol.RbdImageName == "" {
 			return depth, nil
 		}
+		err := vol.openIoctx()
+		if err != nil {
+			return depth, err
+		}
+
 		err = vol.getImageInfo()
+		// FIXME: create and destroy the vol inside the loop.
+		// see https://github.com/ceph/ceph-csi/pull/1838#discussion_r598530807
+		vol.ioctx.Destroy()
+		vol.ioctx = nil
 		if err != nil {
 			// if the parent image is moved to trash the name will be present
 			// in rbd image info but the image will be in trash, in that case
@@ -561,6 +566,7 @@ func (rv *rbdVolume) getCloneDepth(ctx context.Context) (uint, error) {
 			depth++
 		}
 		vol.RbdImageName = vol.ParentName
+		vol.Pool = vol.ParentPool
 	}
 }
 
@@ -700,7 +706,6 @@ func (rv *rbdVolume) hasFeature(feature uint64) bool {
 
 func (rv *rbdVolume) checkImageChainHasFeature(ctx context.Context, feature uint64) (bool, error) {
 	vol := rbdVolume{}
-	defer vol.Destroy()
 
 	vol.Pool = rv.Pool
 	vol.RadosNamespace = rv.RadosNamespace
@@ -708,16 +713,20 @@ func (rv *rbdVolume) checkImageChainHasFeature(ctx context.Context, feature uint
 	vol.RbdImageName = rv.RbdImageName
 	vol.conn = rv.conn.Copy()
 
-	err := vol.openIoctx()
-	if err != nil {
-		return false, err
-	}
-
 	for {
 		if vol.RbdImageName == "" {
 			return false, nil
 		}
+		err := vol.openIoctx()
+		if err != nil {
+			return false, err
+		}
+
 		err = vol.getImageInfo()
+		// FIXME: create and destroy the vol inside the loop.
+		// see https://github.com/ceph/ceph-csi/pull/1838#discussion_r598530807
+		vol.ioctx.Destroy()
+		vol.ioctx = nil
 		if err != nil {
 			// call to getImageInfo returns the parent name even if the parent
 			// is in the trash, when we try to open the parent image to get its
@@ -733,6 +742,7 @@ func (rv *rbdVolume) checkImageChainHasFeature(ctx context.Context, feature uint
 			return true, nil
 		}
 		vol.RbdImageName = vol.ParentName
+		vol.Pool = vol.ParentPool
 	}
 }
 
@@ -993,6 +1003,13 @@ func genVolFromVolumeOptions(ctx context.Context, volOptions, credentials map[st
 }
 
 func (rv *rbdVolume) validateImageFeatures(imageFeatures string) error {
+	// It is possible for image features to be an empty string which
+	// the Go split function would return a single item array with
+	// an empty string, causing a failure when trying to validate
+	// the features.
+	if strings.TrimSpace(imageFeatures) == "" {
+		return nil
+	}
 	arr := strings.Split(imageFeatures, ",")
 	featureSet := sets.NewString(arr...)
 	for _, f := range arr {
@@ -1072,10 +1089,18 @@ func (rv *rbdVolume) deleteSnapshot(ctx context.Context, pOpts *rbdSnapshot) err
 	return err
 }
 
-func (rv *rbdVolume) cloneRbdImageFromSnapshot(ctx context.Context, pSnapOpts *rbdSnapshot) error {
-	image := rv.RbdImageName
+func (rv *rbdVolume) cloneRbdImageFromSnapshot(ctx context.Context, pSnapOpts *rbdSnapshot, parentVol *rbdVolume) error {
 	var err error
 	logMsg := "rbd: clone %s %s (features: %s) using mon %s"
+
+	err = parentVol.openIoctx()
+	if err != nil {
+		return fmt.Errorf("failed to get parent IOContext: %w", err)
+	}
+	defer func() {
+		defer parentVol.ioctx.Destroy()
+		parentVol.ioctx = nil
+	}()
 
 	options := librbd.NewRbdImageOptions()
 	defer options.Destroy()
@@ -1089,7 +1114,7 @@ func (rv *rbdVolume) cloneRbdImageFromSnapshot(ctx context.Context, pSnapOpts *r
 	}
 
 	util.DebugLog(ctx, logMsg,
-		pSnapOpts, image, rv.imageFeatureSet.Names(), rv.Monitors)
+		pSnapOpts, rv, rv.imageFeatureSet.Names(), rv.Monitors)
 
 	if rv.imageFeatureSet != 0 {
 		err = options.SetUint64(librbd.RbdImageOptionFeatures, uint64(rv.imageFeatureSet))
@@ -1103,12 +1128,13 @@ func (rv *rbdVolume) cloneRbdImageFromSnapshot(ctx context.Context, pSnapOpts *r
 		return fmt.Errorf("failed to set image features: %w", err)
 	}
 
+	// As the clone is yet to be created, open the Ioctx.
 	err = rv.openIoctx()
 	if err != nil {
 		return fmt.Errorf("failed to get IOContext: %w", err)
 	}
 
-	err = librbd.CloneImage(rv.ioctx, pSnapOpts.RbdImageName, pSnapOpts.RbdSnapName, rv.ioctx, rv.RbdImageName, options)
+	err = librbd.CloneImage(parentVol.ioctx, pSnapOpts.RbdImageName, pSnapOpts.RbdSnapName, rv.ioctx, rv.RbdImageName, options)
 	if err != nil {
 		return fmt.Errorf("failed to create rbd clone: %w", err)
 	}
@@ -1173,6 +1199,7 @@ func (rv *rbdVolume) getImageInfo() error {
 		}
 	} else {
 		rv.ParentName = parentInfo.Image.ImageName
+		rv.ParentPool = parentInfo.Image.PoolName
 	}
 	// Get image creation time
 	tm, err := image.GetCreateTimestamp()
@@ -1527,4 +1554,16 @@ func (rv *rbdVolume) getOrigSnapName(snapID uint64) (string, error) {
 	}
 
 	return origSnapName, nil
+}
+
+func (ri *rbdImage) isCompatibleEncryption(dst *rbdImage) error {
+	switch {
+	case ri.isEncrypted() && !dst.isEncrypted():
+		return fmt.Errorf("encrypted volume %q does not match unencrypted volume %q", ri, dst)
+
+	case !ri.isEncrypted() && dst.isEncrypted():
+		return fmt.Errorf("unencrypted volume %q does not match encrypted volume %q", ri, dst)
+	}
+
+	return nil
 }

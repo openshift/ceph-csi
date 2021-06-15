@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 
+	"github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
 	v1 "k8s.io/api/core/v1"
 	scv1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -30,11 +32,14 @@ func rbdOptions(pool string) string {
 	return "--pool=" + pool
 }
 
-func createRBDStorageClass(c kubernetes.Interface, f *framework.Framework, scOptions, parameters map[string]string, policy v1.PersistentVolumeReclaimPolicy) error {
+func createRBDStorageClass(c kubernetes.Interface, f *framework.Framework, name string, scOptions, parameters map[string]string, policy v1.PersistentVolumeReclaimPolicy) error {
 	scPath := fmt.Sprintf("%s/%s", rbdExamplePath, "storageclass.yaml")
 	sc, err := getStorageClass(scPath)
 	if err != nil {
 		return nil
+	}
+	if name != "" {
+		sc.Name = name
 	}
 	sc.Parameters["pool"] = defaultRBDPool
 	sc.Parameters["csi.storage.k8s.io/provisioner-secret-namespace"] = cephCSINamespace
@@ -68,7 +73,7 @@ func createRBDStorageClass(c kubernetes.Interface, f *framework.Framework, scOpt
 	}
 
 	// comma separated mount options
-	if opt, ok := scOptions[rbdmountOptions]; ok {
+	if opt, ok := scOptions[rbdMountOptions]; ok {
 		mOpt := strings.Split(opt, ",")
 		sc.MountOptions = append(sc.MountOptions, mOpt...)
 	}
@@ -229,6 +234,144 @@ func kmsIsVault(kms string) bool {
 	return kms == "vault"
 }
 
+func logErrors(f *framework.Framework, msg string, wgErrs []error) int {
+	failures := 0
+	for i, err := range wgErrs {
+		if err != nil {
+			// not using Failf() as it aborts the test and does not log other errors
+			e2elog.Logf("%s (%s%d): %v", msg, f.UniqueName, i, err)
+			failures++
+		}
+	}
+	return failures
+}
+
+func validateCloneInDifferentPool(f *framework.Framework, snapshotPool, cloneSc, destImagePool string) error {
+	var wg sync.WaitGroup
+	totalCount := 10
+	wgErrs := make([]error, totalCount)
+	wg.Add(totalCount)
+	pvc, err := loadPVC(pvcPath)
+	if err != nil {
+		return fmt.Errorf("failed to load PVC with error %v", err)
+	}
+
+	pvc.Namespace = f.UniqueName
+	err = createPVCAndvalidatePV(f.ClientSet, pvc, deployTimeout)
+	if err != nil {
+		return fmt.Errorf("failed to create PVC with error %v", err)
+	}
+	validateRBDImageCount(f, 1, defaultRBDPool)
+	snap := getSnapshot(snapshotPath)
+	snap.Namespace = f.UniqueName
+	snap.Spec.Source.PersistentVolumeClaimName = &pvc.Name
+	// create snapshot
+	for i := 0; i < totalCount; i++ {
+		go func(w *sync.WaitGroup, n int, s v1beta1.VolumeSnapshot) {
+			s.Name = fmt.Sprintf("%s%d", f.UniqueName, n)
+			wgErrs[n] = createSnapshot(&s, deployTimeout)
+			w.Done()
+		}(&wg, i, snap)
+	}
+	wg.Wait()
+
+	if failed := logErrors(f, "failed to create snapshot", wgErrs); failed != 0 {
+		return fmt.Errorf("creating snapshots failed, %d errors were logged", failed)
+	}
+
+	// delete parent pvc
+	err = deletePVCAndValidatePV(f.ClientSet, pvc, deployTimeout)
+	if err != nil {
+		return fmt.Errorf("failed to delete PVC with error %v", err)
+	}
+
+	// validate the rbd images created for snapshots
+	validateRBDImageCount(f, totalCount, snapshotPool)
+
+	pvcClone, err := loadPVC(pvcClonePath)
+	if err != nil {
+		return fmt.Errorf("failed to load PVC with error %v", err)
+	}
+	appClone, err := loadApp(appClonePath)
+	if err != nil {
+		return fmt.Errorf("failed to load application with error %v", err)
+	}
+	pvcClone.Namespace = f.UniqueName
+	// if request is to create clone with different storage class
+	if cloneSc != "" {
+		pvcClone.Spec.StorageClassName = &cloneSc
+	}
+	appClone.Namespace = f.UniqueName
+	pvcClone.Spec.DataSource.Name = fmt.Sprintf("%s%d", f.UniqueName, 0)
+	// create multiple PVCs from same snapshot
+	wg.Add(totalCount)
+	for i := 0; i < totalCount; i++ {
+		go func(w *sync.WaitGroup, n int, p v1.PersistentVolumeClaim, a v1.Pod) {
+			name := fmt.Sprintf("%s%d", f.UniqueName, n)
+			wgErrs[n] = createPVCAndApp(name, f, &p, &a, deployTimeout)
+			w.Done()
+		}(&wg, i, *pvcClone, *appClone)
+	}
+	wg.Wait()
+
+	if failed := logErrors(f, "failed to create PVC and application", wgErrs); failed != 0 {
+		return fmt.Errorf("creating PVCs and applications failed, %d errors were logged", failed)
+	}
+
+	// total images in pool is total snaps + total clones
+	if destImagePool == snapshotPool {
+		totalCloneCount := totalCount + totalCount
+		validateRBDImageCount(f, totalCloneCount, snapshotPool)
+	} else {
+		// if clones are created in different pool we will have only rbd images of
+		// count equal to totalCount
+		validateRBDImageCount(f, totalCount, destImagePool)
+	}
+	wg.Add(totalCount)
+	// delete clone and app
+	for i := 0; i < totalCount; i++ {
+		go func(w *sync.WaitGroup, n int, p v1.PersistentVolumeClaim, a v1.Pod) {
+			name := fmt.Sprintf("%s%d", f.UniqueName, n)
+			p.Spec.DataSource.Name = name
+			wgErrs[n] = deletePVCAndApp(name, f, &p, &a)
+			w.Done()
+		}(&wg, i, *pvcClone, *appClone)
+	}
+	wg.Wait()
+
+	if failed := logErrors(f, "failed to delete PVC and application", wgErrs); failed != 0 {
+		return fmt.Errorf("deleting PVCs and applications failed, %d errors were logged", failed)
+	}
+
+	if destImagePool == snapshotPool {
+		// as we have deleted all clones total images in pool is total snaps
+		validateRBDImageCount(f, totalCount, snapshotPool)
+	} else {
+		// we have deleted all clones
+		validateRBDImageCount(f, 0, destImagePool)
+	}
+
+	wg.Add(totalCount)
+	// delete snapshot
+	for i := 0; i < totalCount; i++ {
+		go func(w *sync.WaitGroup, n int, s v1beta1.VolumeSnapshot) {
+			s.Name = fmt.Sprintf("%s%d", f.UniqueName, n)
+			wgErrs[n] = deleteSnapshot(&s, deployTimeout)
+			w.Done()
+		}(&wg, i, snap)
+	}
+	wg.Wait()
+
+	if failed := logErrors(f, "failed to delete snapshot", wgErrs); failed != 0 {
+		return fmt.Errorf("deleting snapshots failed, %d errors were logged", failed)
+	}
+	// validate all pools are empty
+	validateRBDImageCount(f, 0, snapshotPool)
+	validateRBDImageCount(f, 0, defaultRBDPool)
+	validateRBDImageCount(f, 0, destImagePool)
+	return nil
+}
+
 func validateEncryptedPVCAndAppBinding(pvcPath, appPath, kms string, f *framework.Framework) error {
 	pvc, app, err := createPVCAndAppBinding(pvcPath, appPath, f, deployTimeout)
 	if err != nil {
@@ -303,11 +446,11 @@ func validateEncryptedImage(f *framework.Framework, rbdImageSpec string, app *v1
 	return nil
 }
 
-func listRBDImages(f *framework.Framework) ([]string, error) {
+func listRBDImages(f *framework.Framework, pool string) ([]string, error) {
 	var imgInfos []string
 
 	stdout, stdErr, err := execCommandInToolBoxPod(f,
-		fmt.Sprintf("rbd ls --format=json %s", rbdOptions(defaultRBDPool)), rookNamespace)
+		fmt.Sprintf("rbd ls --format=json %s", rbdOptions(pool)), rookNamespace)
 	if err != nil {
 		return imgInfos, err
 	}
@@ -417,6 +560,23 @@ func deletePool(name string, cephfs bool, f *framework.Framework) error {
 		}
 	}
 	return nil
+}
+
+func createPool(f *framework.Framework, name string) error {
+	var (
+		pgCount = 128
+		size    = 1
+	)
+	// ceph osd pool create replicapool
+	cmd := fmt.Sprintf("ceph osd pool create %s %d", name, pgCount)
+	_, _, err := execCommandInToolBoxPod(f, cmd, rookNamespace)
+	if err != nil {
+		return err
+	}
+	// ceph osd pool set replicapool size 1
+	cmd = fmt.Sprintf("ceph osd pool set %s size %d --yes-i-really-mean-it", name, size)
+	_, _, err = execCommandInToolBoxPod(f, cmd, rookNamespace)
+	return err
 }
 
 func getPVCImageInfoInPool(f *framework.Framework, pvc *v1.PersistentVolumeClaim, pool string) (string, error) {
@@ -554,7 +714,7 @@ func validateThickPVC(f *framework.Framework, pvc *v1.PersistentVolumeClaim, siz
 	if err != nil {
 		return fmt.Errorf("failed to create PVC with error %w", err)
 	}
-	validateRBDImageCount(f, 1)
+	validateRBDImageCount(f, 1, defaultRBDPool)
 
 	// nothing has been written, but the image should be allocated
 	du, err := getRbdDu(f, pvc)
@@ -598,7 +758,7 @@ func validateThickPVC(f *framework.Framework, pvc *v1.PersistentVolumeClaim, siz
 	if err != nil {
 		return fmt.Errorf("failed to delete PVC with error: %w", err)
 	}
-	validateRBDImageCount(f, 0)
+	validateRBDImageCount(f, 0, defaultRBDPool)
 
 	return nil
 }

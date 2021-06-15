@@ -24,10 +24,10 @@ import (
 	e2elog "k8s.io/kubernetes/test/e2e/framework/log"
 )
 
-/* #nosec:G101, values not credententials, just a reference to the location.*/
+/* #nosec:G101, values not credentials, just a reference to the location.*/
 const (
-	defaultNs = "default"
-
+	defaultNs     = "default"
+	defaultSCName = ""
 	// vaultBackendPath is the default VAULT_BACKEND_PATH for secrets
 	vaultBackendPath = "secret/"
 	// vaultPassphrasePath is an advanced configuration option, only
@@ -35,7 +35,7 @@ const (
 	vaultPassphrasePath = "ceph-csi/"
 
 	rookToolBoxPodLabel = "app=rook-ceph-tools"
-	rbdmountOptions     = "mountOptions"
+	rbdMountOptions     = "mountOptions"
 
 	retainPolicy = v1.PersistentVolumeReclaimRetain
 	// deletePolicy is the default policy in E2E.
@@ -561,7 +561,7 @@ func validatePVCClone(totalCount int, sourcePvcPath, sourceAppPath, clonePvcPath
 		}
 	}
 	// validate created backend rbd images
-	validateRBDImageCount(f, 1)
+	validateRBDImageCount(f, 1, defaultRBDPool)
 	pvcClone, err := loadPVC(clonePvcPath)
 	if err != nil {
 		e2elog.Failf("failed to load PVC with error %v", err)
@@ -587,7 +587,7 @@ func validatePVCClone(totalCount int, sourcePvcPath, sourceAppPath, clonePvcPath
 			wgErrs[n] = createPVCAndApp(name, f, &p, &a, deployTimeout)
 			if *pvc.Spec.VolumeMode == v1.PersistentVolumeFilesystem && wgErrs[n] == nil {
 				filePath := a.Spec.Containers[0].VolumeMounts[0].MountPath + "/test"
-				checkSumClone := ""
+				var checkSumClone string
 				e2elog.Logf("Calculating checksum clone for filepath %s", filePath)
 				checkSumClone, chErrs[n] = calculateSHA512sum(f, &a, filePath, &opt)
 				e2elog.Logf("checksum for clone is %s", checkSumClone)
@@ -632,7 +632,7 @@ func validatePVCClone(totalCount int, sourcePvcPath, sourceAppPath, clonePvcPath
 	// total images in cluster is 1 parent rbd image+ total
 	// temporary clone+ total clones
 	totalCloneCount := totalCount + totalCount + 1
-	validateRBDImageCount(f, totalCloneCount)
+	validateRBDImageCount(f, totalCloneCount, defaultRBDPool)
 	// delete parent pvc
 	err = deletePVCAndValidatePV(f.ClientSet, pvc, deployTimeout)
 	if err != nil {
@@ -640,7 +640,7 @@ func validatePVCClone(totalCount int, sourcePvcPath, sourceAppPath, clonePvcPath
 	}
 
 	totalCloneCount = totalCount + totalCount
-	validateRBDImageCount(f, totalCloneCount)
+	validateRBDImageCount(f, totalCloneCount, defaultRBDPool)
 	wg.Add(totalCount)
 	// delete clone and app
 	for i := 0; i < totalCount; i++ {
@@ -664,11 +664,11 @@ func validatePVCClone(totalCount int, sourcePvcPath, sourceAppPath, clonePvcPath
 		e2elog.Failf("deleting PVCs and applications failed, %d errors were logged", failed)
 	}
 
-	validateRBDImageCount(f, 0)
+	validateRBDImageCount(f, 0, defaultRBDPool)
 }
 
 // nolint:gocyclo,gocognit,nestif // reduce complexity
-func validatePVCSnapshot(totalCount int, pvcPath, appPath, snapshotPath, pvcClonePath, appClonePath, kms string, validateEncryption bool, f *framework.Framework) {
+func validatePVCSnapshot(totalCount int, pvcPath, appPath, snapshotPath, pvcClonePath, appClonePath, kms string, f *framework.Framework) {
 	var wg sync.WaitGroup
 	wgErrs := make([]error, totalCount)
 	chErrs := make([]error, totalCount)
@@ -711,7 +711,7 @@ func validatePVCSnapshot(totalCount int, pvcPath, appPath, snapshotPath, pvcClon
 	if err != nil {
 		e2elog.Failf("failed to calculate checksum with error %v", err)
 	}
-	validateRBDImageCount(f, 1)
+	validateRBDImageCount(f, 1, defaultRBDPool)
 	snap := getSnapshot(snapshotPath)
 	snap.Namespace = f.UniqueName
 	snap.Spec.Source.PersistentVolumeClaimName = &pvc.Name
@@ -720,7 +720,7 @@ func validatePVCSnapshot(totalCount int, pvcPath, appPath, snapshotPath, pvcClon
 		go func(w *sync.WaitGroup, n int, s v1beta1.VolumeSnapshot) {
 			s.Name = fmt.Sprintf("%s%d", f.UniqueName, n)
 			wgErrs[n] = createSnapshot(&s, deployTimeout)
-			if wgErrs[n] == nil && validateEncryption {
+			if wgErrs[n] == nil && kms != "" {
 				if kmsIsVault(kms) || kms == vaultTokens {
 					content, sErr := getVolumeSnapshotContent(s.Namespace, s.Name)
 					if sErr != nil {
@@ -752,7 +752,7 @@ func validatePVCSnapshot(totalCount int, pvcPath, appPath, snapshotPath, pvcClon
 	}
 
 	// total images in cluster is 1 parent rbd image+ total snaps
-	validateRBDImageCount(f, totalCount+1)
+	validateRBDImageCount(f, totalCount+1, defaultRBDPool)
 	pvcClone, err := loadPVC(pvcClonePath)
 	if err != nil {
 		e2elog.Failf("failed to load PVC with error %v", err)
@@ -779,7 +779,7 @@ func validatePVCSnapshot(totalCount int, pvcPath, appPath, snapshotPath, pvcClon
 			wgErrs[n] = createPVCAndApp(name, f, &p, &a, deployTimeout)
 			if wgErrs[n] == nil {
 				filePath := a.Spec.Containers[0].VolumeMounts[0].MountPath + "/test"
-				checkSumClone := ""
+				var checkSumClone string
 				e2elog.Logf("calculating checksum clone for filepath %s", filePath)
 				checkSumClone, chErrs[n] = calculateSHA512sum(f, &a, filePath, &opt)
 				e2elog.Logf("checksum value for the clone is %s with pod name %s", checkSumClone, name)
@@ -790,7 +790,7 @@ func validatePVCSnapshot(totalCount int, pvcPath, appPath, snapshotPath, pvcClon
 					e2elog.Logf("checksum value didn't match. checksum=%s and checksumclone=%s", checkSum, checkSumClone)
 				}
 			}
-			if wgErrs[n] == nil && validateEncryption {
+			if wgErrs[n] == nil && kms != "" {
 				wgErrs[n] = validateEncryptedPVC(f, &p, &a)
 			}
 			w.Done()
@@ -822,7 +822,7 @@ func validatePVCSnapshot(totalCount int, pvcPath, appPath, snapshotPath, pvcClon
 	// total images in cluster is 1 parent rbd image+ total
 	// snaps+ total clones
 	totalCloneCount := totalCount + totalCount + 1
-	validateRBDImageCount(f, totalCloneCount)
+	validateRBDImageCount(f, totalCloneCount, defaultRBDPool)
 	wg.Add(totalCount)
 	// delete clone and app
 	for i := 0; i < totalCount; i++ {
@@ -848,7 +848,7 @@ func validatePVCSnapshot(totalCount int, pvcPath, appPath, snapshotPath, pvcClon
 
 	// total images in cluster is 1 parent rbd image+ total
 	// snaps
-	validateRBDImageCount(f, totalCount+1)
+	validateRBDImageCount(f, totalCount+1, defaultRBDPool)
 	// create clones from different snapshots and bind it to an
 	// app
 	wg.Add(totalCount)
@@ -876,7 +876,7 @@ func validatePVCSnapshot(totalCount int, pvcPath, appPath, snapshotPath, pvcClon
 	// total images in cluster is 1 parent rbd image+ total
 	// snaps+ total clones
 	totalCloneCount = totalCount + totalCount + 1
-	validateRBDImageCount(f, totalCloneCount)
+	validateRBDImageCount(f, totalCloneCount, defaultRBDPool)
 	// delete parent pvc
 	err = deletePVCAndValidatePV(f.ClientSet, pvc, deployTimeout)
 	if err != nil {
@@ -885,7 +885,7 @@ func validatePVCSnapshot(totalCount int, pvcPath, appPath, snapshotPath, pvcClon
 
 	// total images in cluster is total snaps+ total clones
 	totalSnapCount := totalCount + totalCount
-	validateRBDImageCount(f, totalSnapCount)
+	validateRBDImageCount(f, totalSnapCount, defaultRBDPool)
 	wg.Add(totalCount)
 	// delete snapshot
 	for i := 0; i < totalCount; i++ {
@@ -893,7 +893,7 @@ func validatePVCSnapshot(totalCount int, pvcPath, appPath, snapshotPath, pvcClon
 			s.Name = fmt.Sprintf("%s%d", f.UniqueName, n)
 			content := &v1beta1.VolumeSnapshotContent{}
 			var err error
-			if validateEncryption {
+			if kms != "" {
 				if kmsIsVault(kms) || kms == vaultTokens {
 					content, err = getVolumeSnapshotContent(s.Namespace, s.Name)
 					if err != nil {
@@ -903,7 +903,7 @@ func validatePVCSnapshot(totalCount int, pvcPath, appPath, snapshotPath, pvcClon
 			}
 			if wgErrs[n] == nil {
 				wgErrs[n] = deleteSnapshot(&s, deployTimeout)
-				if wgErrs[n] == nil && validateEncryption {
+				if wgErrs[n] == nil && kms != "" {
 					if kmsIsVault(kms) || kms == vaultTokens {
 						// check passphrase deleted
 						stdOut, _ := readVaultSecret(*content.Status.SnapshotHandle, kmsIsVault(kms), f)
@@ -929,7 +929,7 @@ func validatePVCSnapshot(totalCount int, pvcPath, appPath, snapshotPath, pvcClon
 		e2elog.Failf("deleting snapshots failed, %d errors were logged", failed)
 	}
 
-	validateRBDImageCount(f, totalCount)
+	validateRBDImageCount(f, totalCount, defaultRBDPool)
 	wg.Add(totalCount)
 	// delete clone and app
 	for i := 0; i < totalCount; i++ {
@@ -954,7 +954,7 @@ func validatePVCSnapshot(totalCount int, pvcPath, appPath, snapshotPath, pvcClon
 	}
 
 	// validate created backend rbd images
-	validateRBDImageCount(f, 0)
+	validateRBDImageCount(f, 0, defaultRBDPool)
 }
 
 // validateController simulates the required operations to validate the
@@ -975,7 +975,7 @@ func validateController(f *framework.Framework, pvcPath, appPath, scPath string)
 	expandSize := "10Gi"
 	var err error
 	// create storageclass with retain
-	err = createRBDStorageClass(f.ClientSet, f, nil, nil, retainPolicy)
+	err = createRBDStorageClass(f.ClientSet, f, defaultSCName, nil, nil, retainPolicy)
 	if err != nil {
 		return fmt.Errorf("failed to create storageclass with error %v", err)
 	}
@@ -1007,7 +1007,7 @@ func validateController(f *framework.Framework, pvcPath, appPath, scPath string)
 	if err != nil {
 		return fmt.Errorf("failed to delete storageclass with error %v", err)
 	}
-	err = createRBDStorageClass(f.ClientSet, f, nil, nil, deletePolicy)
+	err = createRBDStorageClass(f.ClientSet, f, defaultSCName, nil, nil, deletePolicy)
 	if err != nil {
 		return fmt.Errorf("failed to create storageclass with error %v", err)
 	}

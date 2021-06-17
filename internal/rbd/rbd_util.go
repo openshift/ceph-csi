@@ -471,6 +471,9 @@ func addRbdManagerTask(ctx context.Context, pOpts *rbdVolume, arg []string) (boo
 			util.WarningLog(ctx, "uncaught error while scheduling a task (%v): %s", err, stderr)
 		}
 	}
+	if err != nil {
+		err = fmt.Errorf("%w. stdError:%s", err, stderr)
+	}
 	return supported, err
 }
 
@@ -1559,10 +1562,10 @@ func (rv *rbdVolume) getOrigSnapName(snapID uint64) (string, error) {
 func (ri *rbdImage) isCompatibleEncryption(dst *rbdImage) error {
 	switch {
 	case ri.isEncrypted() && !dst.isEncrypted():
-		return fmt.Errorf("encrypted volume %q does not match unencrypted volume %q", ri, dst)
+		return fmt.Errorf("cannot create unencrypted volume from encrypted volume %q", ri)
 
 	case !ri.isEncrypted() && dst.isEncrypted():
-		return fmt.Errorf("unencrypted volume %q does not match encrypted volume %q", ri, dst)
+		return fmt.Errorf("cannot create encrypted volume from unencrypted volume %q", ri)
 	}
 
 	return nil

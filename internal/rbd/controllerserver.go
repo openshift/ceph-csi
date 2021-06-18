@@ -117,7 +117,7 @@ func (cs *ControllerServer) parseVolCreateRequest(ctx context.Context, req *csi.
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	rbdVol.ThickProvision = cs.isThickProvisionRequest(req)
+	rbdVol.ThickProvision = isThickProvisionRequest(req.GetParameters())
 
 	rbdVol.RequestName = req.GetName()
 
@@ -222,8 +222,18 @@ func checkValidCreateVolumeRequest(rbdVol, parentVol *rbdVolume, rbdSnap *rbdSna
 		if err != nil {
 			return status.Errorf(codes.InvalidArgument, "cannot restore from snapshot %s: %s", rbdSnap, err.Error())
 		}
+
+		err = rbdSnap.isCompatibleThickProvision(rbdVol)
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "cannot restore from snapshot %s: %s", rbdSnap, err.Error())
+		}
 	case parentVol != nil:
 		err = parentVol.isCompatibleEncryption(&rbdVol.rbdImage)
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "cannot clone from volume %s: %s", parentVol, err.Error())
+		}
+
+		err = parentVol.isCompatibleThickProvision(rbdVol)
 		if err != nil {
 			return status.Errorf(codes.InvalidArgument, "cannot clone from volume %s: %s", parentVol, err.Error())
 		}
@@ -272,7 +282,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	if err != nil {
 		return nil, getGRPCErrorForCreateVolume(err)
 	} else if found {
-		return cs.repairExistingVolume(ctx, req, cr, rbdVol, rbdSnap)
+		return cs.repairExistingVolume(ctx, req, cr, rbdVol, parentVol, rbdSnap)
 	}
 
 	err = checkValidCreateVolumeRequest(rbdVol, parentVol, rbdSnap, cr)
@@ -335,7 +345,7 @@ func flattenParentImage(ctx context.Context, rbdVol *rbdVolume, cr *util.Credent
 // that the state is corrected to what was requested. It is needed to call this
 // when the process of creating a volume was interrupted.
 func (cs *ControllerServer) repairExistingVolume(ctx context.Context, req *csi.CreateVolumeRequest,
-	cr *util.Credentials, rbdVol *rbdVolume, rbdSnap *rbdSnapshot) (*csi.CreateVolumeResponse, error) {
+	cr *util.Credentials, rbdVol, parentVol *rbdVolume, rbdSnap *rbdSnapshot) (*csi.CreateVolumeResponse, error) {
 	vcs := req.GetVolumeContentSource()
 
 	switch {
@@ -343,7 +353,7 @@ func (cs *ControllerServer) repairExistingVolume(ctx context.Context, req *csi.C
 	case vcs == nil:
 		// continue/restart allocating the volume in case it
 		// should be thick-provisioned
-		if cs.isThickProvisionRequest(req) {
+		if isThickProvisionRequest(req.GetParameters()) {
 			err := rbdVol.RepairThickProvision()
 			if err != nil {
 				return nil, status.Error(codes.Internal, err.Error())
@@ -364,9 +374,29 @@ func (cs *ControllerServer) repairExistingVolume(ctx context.Context, req *csi.C
 			return nil, err
 		}
 
-	// rbdVol is a clone from an other volume
+	// rbdVol is a clone from parentVol
 	case vcs.GetVolume() != nil:
-		// TODO: is there really nothing to repair on image clone?
+		// When cloning into a thick-provisioned volume was happening,
+		// the image should be marked as thick-provisioned, unless it
+		// was aborted in flight. In order to restart the
+		// thick-cloning, delete the volume and let the caller retry
+		// from the start.
+		if isThickProvisionRequest(req.GetParameters()) {
+			thick, err := rbdVol.isThickProvisioned()
+			if err != nil {
+				return nil, status.Errorf(codes.Aborted, "failed to verify thick-provisioned volume %q: %s", rbdVol, err)
+			} else if !thick {
+				err = cleanUpSnapshot(ctx, parentVol, rbdSnap, rbdVol, cr)
+				if err != nil {
+					return nil, status.Errorf(codes.Aborted, "failed to remove partially cloned volume %q: %s", rbdVol, err)
+				}
+				err = undoVolReservation(ctx, rbdVol, cr)
+				if err != nil {
+					return nil, status.Errorf(codes.Aborted, "failed to remove volume %q from journal: %s", rbdVol, err)
+				}
+				return nil, status.Errorf(codes.Aborted, "cloning thick-provisioned volume %q has been interrupted, please retry", rbdVol)
+			}
+		}
 	}
 
 	return buildCreateVolumeResponse(req, rbdVol), nil
@@ -379,6 +409,11 @@ func (cs *ControllerServer) repairExistingVolume(ctx context.Context, req *csi.C
 // are more than the `minSnapshotOnImage` Add a task to flatten all the
 // temporary cloned images.
 func flattenTemporaryClonedImages(ctx context.Context, rbdVol *rbdVolume, cr *util.Credentials) error {
+	if rbdVol.ThickProvision {
+		// thick-provisioned images do not need flattening
+		return nil
+	}
+
 	snaps, err := rbdVol.listSnapshots()
 	if err != nil {
 		if errors.Is(err, ErrImageNotFound) {
@@ -860,6 +895,30 @@ func cloneFromSnapshot(ctx context.Context, rbdVol *rbdVolume, rbdSnap *rbdSnaps
 		}
 	}
 
+	// The clone image created during CreateSnapshot has to be marked as thick.
+	// As snapshot and volume both are independent we cannot depend on the
+	// parent volume of the clone to check thick provision during CreateVolume
+	// from snapshot operation because the parent volume can be deleted anytime
+	// after snapshot is created.
+	// TODO: copy thick provision config
+	thick, err := rbdVol.isThickProvisioned()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed checking thick-provisioning of %q: %s", rbdVol, err)
+	}
+
+	if thick {
+		// check the thick metadata is already set on the clone image.
+		thick, err = vol.isThickProvisioned()
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed checking thick-provisioning of %q: %s", vol, err)
+		}
+		if !thick {
+			err = vol.setThickProvisioned()
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "failed mark %q thick-provisioned: %s", vol, err)
+			}
+		}
+	}
 	// if flattening is not needed, the snapshot is ready for use
 	readyToUse := true
 
@@ -948,6 +1007,24 @@ func (cs *ControllerServer) doSnapshotClone(ctx context.Context, parentVol *rbdV
 				"config for %q: %v", cloneRbd, cryptErr)
 			return ready, nil, status.Errorf(codes.Internal,
 				err.Error())
+		}
+	}
+
+	// The clone image created during CreateSnapshot has to be marked as thick.
+	// As snapshot and volume both are independent we cannot depend on the
+	// parent volume of the clone to check thick provision during CreateVolume
+	// from snapshot operation because the parent volume can be deleted anytime
+	// after snapshot is created.
+	// TODO: copy thick provision config
+	thick, err := parentVol.isThickProvisioned()
+	if err != nil {
+		return ready, nil, status.Errorf(codes.Internal, "failed checking thick-provisioning of %q: %s", parentVol, err)
+	}
+
+	if thick {
+		err = cloneRbd.setThickProvisioned()
+		if err != nil {
+			return ready, nil, status.Errorf(codes.Internal, "failed mark %q thick-provisioned: %s", cloneRbd, err)
 		}
 	}
 
@@ -1171,10 +1248,10 @@ func (cs *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi
 
 // isThickProvisionRequest returns true in case the request contains the
 // `thickProvision` option set to `true`.
-func (cs *ControllerServer) isThickProvisionRequest(req *csi.CreateVolumeRequest) bool {
+func isThickProvisionRequest(parameters map[string]string) bool {
 	tp := "thickProvision"
 
-	thick, ok := req.GetParameters()[tp]
+	thick, ok := parameters[tp]
 	if !ok || thick == "" {
 		return false
 	}

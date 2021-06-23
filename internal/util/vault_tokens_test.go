@@ -158,3 +158,62 @@ func TestStdVaultToCSIConfig(t *testing.T) {
 		t.Errorf("unexpected value for VaultCAVerify: %s", v.VaultCAVerify)
 	}
 }
+
+// TestConfigHeader verifies that a configuration can be detected as
+// standardVault (by UI created) type.
+func TestConfigHeader(t *testing.T) {
+	vaultConfigMap := `{
+		"KMS_PROVIDER":"vaulttokens",
+		"VAULT_ADDR":"https://vault.example.com",
+		"VAULT_BACKEND_PATH":"/secret",
+		"VAULT_CACERT":"",
+		"VAULT_TLS_SERVER_NAME":"vault.example.com",
+		"VAULT_CLIENT_CERT":"",
+		"VAULT_CLIENT_KEY":"",
+		"VAULT_NAMESPACE":"a-department",
+		"VAULT_SKIP_VERIFY":"true"
+	}`
+
+	kch, err := kmsConfigHeaderNew(vaultConfigMap)
+	if err != nil {
+		t.Errorf("failed to convert config to kmsConfigHeader: %v", err)
+	}
+	if !kch.isVaultTokensConfigMap() {
+		t.Errorf("configuration was not detected as VaultToken provider: %v", err)
+	}
+}
+
+// TestDataToMap takes configuration options in a json formatted string and
+// converts it to a key/value map[string]string.
+func TestDataToMap(t *testing.T) {
+	vaultConfigMap := `{
+		"encryptionKMSType": "vault",
+		"vaultAddress": "http://vault.default.svc.cluster.local:8200",
+		"vaultAuthPath": "/v1/auth/kubernetes/login",
+		"vaultRole": "csi-kubernetes",
+		"vaultPassphraseRoot": "/v1/secret",
+		"vaultPassphrasePath": "ceph-csi/",
+		"vaultCAVerify": "false"
+	}`
+
+	optionsMap := map[string]string{
+		"encryptionKMSType":   "vault",
+		"vaultAddress":        "http://vault.default.svc.cluster.local:8200",
+		"vaultAuthPath":       "/v1/auth/kubernetes/login",
+		"vaultRole":           "csi-kubernetes",
+		"vaultPassphraseRoot": "/v1/secret",
+		"vaultPassphrasePath": "ceph-csi/",
+		"vaultCAVerify":       "false",
+	}
+
+	options, err := dataToMap(vaultConfigMap)
+	if err != nil {
+		t.Errorf("failed to convert config to kmsConfigHeader: %v", err)
+	}
+
+	for k, v := range options {
+		if optionsMap[k] != v {
+			t.Errorf("option %q does not match %q (expected %q)", k, v, optionsMap[k])
+		}
+	}
+}

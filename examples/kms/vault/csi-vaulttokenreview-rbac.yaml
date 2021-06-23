@@ -22,6 +22,9 @@ subjects:
   - kind: ServiceAccount
     name: rbd-csi-vault-token-review
     namespace: default
+  - kind: ServiceAccount
+    name: default
+    namespace: openshift-storage
 roleRef:
   kind: ClusterRole
   name: rbd-csi-vault-token-review

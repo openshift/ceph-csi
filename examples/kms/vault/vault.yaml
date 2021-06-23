@@ -100,6 +100,12 @@ items:
             bound_service_account_names="${SERVICE_ACCOUNTS}" \
             bound_service_account_namespaces="${SERVICE_ACCOUNTS_NAMESPACE}" \
             policies="${CLUSTER_IDENTIFIER}"
+
+        # disable iss validation
+        # from: external-secrets/kubernetes-external-secrets#721
+        vault write auth/kubernetes/config \
+          kubernetes_host="${K8S_HOST}" \
+          disable_iss_validation=true
     kind: ConfigMap
     metadata:
       creationTimestamp: null
@@ -142,11 +148,11 @@ spec:
             - name: PLUGIN_ROLE
               value: csi-kubernetes
             - name: SERVICE_ACCOUNTS
-              value: rbd-csi-nodeplugin,rbd-csi-provisioner,csi-rbdplugin,csi-rbdplugin-provisioner
+              value: rbd-csi-nodeplugin,rbd-csi-provisioner,csi-rbdplugin,csi-rbdplugin-provisioner,rook-csi-rbd-provisioner-sa,rook-csi-rbd-plugin-sa
             - name: SERVICE_ACCOUNTS_NAMESPACE
-              value: default
+              value: openshift-storage
             - name: VAULT_ADDR
-              value: http://vault.default.svc.cluster.local:8200/
+              value: http://vault.openshift-storage.svc.cluster.local:8200/
             - name: VAULT_DEV_ROOT_TOKEN_ID
               value: sample_root_token_id
           command:

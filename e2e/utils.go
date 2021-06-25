@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
+	snapapi "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
 	v1 "k8s.io/api/core/v1"
 	scv1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -55,6 +55,7 @@ var (
 	deployRBD        bool
 	testCephFS       bool
 	testRBD          bool
+	helmTest         bool
 	upgradeTesting   bool
 	upgradeVersion   string
 	cephCSINamespace string
@@ -65,7 +66,7 @@ var (
 	poll             = 2 * time.Second
 )
 
-func initResouces() {
+func initResources() {
 	ns = fmt.Sprintf("--namespace=%v", cephCSINamespace)
 	vaultAddr = fmt.Sprintf("http://vault.%s.svc.cluster.local:8200", cephCSINamespace)
 }
@@ -78,7 +79,7 @@ func getMons(ns string, c kubernetes.Interface) ([]string, error) {
 
 	svcList, err := c.CoreV1().Services(ns).List(context.TODO(), opt)
 	if err != nil {
-		return services, err
+		return services, fmt.Errorf("failed to list services: %w", err)
 	}
 	for i := range svcList.Items {
 		s := fmt.Sprintf("%s.%s.svc.cluster.local:%d", svcList.Items[i].Name, svcList.Items[i].Namespace, svcList.Items[i].Spec.Ports[0].Port)
@@ -717,7 +718,7 @@ func validatePVCSnapshot(totalCount int, pvcPath, appPath, snapshotPath, pvcClon
 	snap.Spec.Source.PersistentVolumeClaimName = &pvc.Name
 	// create snapshot
 	for i := 0; i < totalCount; i++ {
-		go func(w *sync.WaitGroup, n int, s v1beta1.VolumeSnapshot) {
+		go func(w *sync.WaitGroup, n int, s snapapi.VolumeSnapshot) {
 			s.Name = fmt.Sprintf("%s%d", f.UniqueName, n)
 			wgErrs[n] = createSnapshot(&s, deployTimeout)
 			if wgErrs[n] == nil && kms != "" {
@@ -889,9 +890,9 @@ func validatePVCSnapshot(totalCount int, pvcPath, appPath, snapshotPath, pvcClon
 	wg.Add(totalCount)
 	// delete snapshot
 	for i := 0; i < totalCount; i++ {
-		go func(w *sync.WaitGroup, n int, s v1beta1.VolumeSnapshot) {
+		go func(w *sync.WaitGroup, n int, s snapapi.VolumeSnapshot) {
 			s.Name = fmt.Sprintf("%s%d", f.UniqueName, n)
-			content := &v1beta1.VolumeSnapshotContent{}
+			content := &snapapi.VolumeSnapshotContent{}
 			var err error
 			if kms != "" {
 				if kmsIsVault(kms) || kms == vaultTokens {

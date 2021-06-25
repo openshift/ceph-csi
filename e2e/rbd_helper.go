@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
+	snapapi "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
 	v1 "k8s.io/api/core/v1"
 	scv1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -157,12 +157,12 @@ func getImageInfoFromPVC(pvcNamespace, pvcName string, f *framework.Framework) (
 	c := f.ClientSet.CoreV1()
 	pvc, err := c.PersistentVolumeClaims(pvcNamespace).Get(context.TODO(), pvcName, metav1.GetOptions{})
 	if err != nil {
-		return imageData, err
+		return imageData, fmt.Errorf("failed to get pvc: %w", err)
 	}
 
 	pv, err := c.PersistentVolumes().Get(context.TODO(), pvc.Spec.VolumeName, metav1.GetOptions{})
 	if err != nil {
-		return imageData, err
+		return imageData, fmt.Errorf("failed to get pv: %w", err)
 	}
 
 	imageIDRegex := regexp.MustCompile(`(\w+\-?){5}$`)
@@ -270,7 +270,7 @@ func validateCloneInDifferentPool(f *framework.Framework, snapshotPool, cloneSc,
 	snap.Spec.Source.PersistentVolumeClaimName = &pvc.Name
 	// create snapshot
 	for i := 0; i < totalCount; i++ {
-		go func(w *sync.WaitGroup, n int, s v1beta1.VolumeSnapshot) {
+		go func(w *sync.WaitGroup, n int, s snapapi.VolumeSnapshot) {
 			s.Name = fmt.Sprintf("%s%d", f.UniqueName, n)
 			wgErrs[n] = createSnapshot(&s, deployTimeout)
 			w.Done()
@@ -357,7 +357,7 @@ func validateCloneInDifferentPool(f *framework.Framework, snapshotPool, cloneSc,
 	wg.Add(totalCount)
 	// delete snapshot
 	for i := 0; i < totalCount; i++ {
-		go func(w *sync.WaitGroup, n int, s v1beta1.VolumeSnapshot) {
+		go func(w *sync.WaitGroup, n int, s snapapi.VolumeSnapshot) {
 			s.Name = fmt.Sprintf("%s%d", f.UniqueName, n)
 			wgErrs[n] = deleteSnapshot(&s, deployTimeout)
 			w.Done()

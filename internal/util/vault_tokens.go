@@ -100,7 +100,7 @@ func (v *vaultTokenConf) convertStdVaultToCSIConfig(s *standardVault) {
 // dataToStandardVault takes the contents from a single connection
 // configuration from the ConfigMap and converts the UI options to values that
 // the VaultTokens KMS implementation understands.
-func dataToStandardVault(k, v string) (*standardVault, error) {
+func dataToStandardVault(k, v string) (map[string]interface{}, error) {
 	sv := &standardVault{}
 	err := json.Unmarshal([]byte(v), sv)
 	if err != nil {
@@ -118,7 +118,7 @@ func dataToStandardVault(k, v string) (*standardVault, error) {
 		return nil, fmt.Errorf("failed to Unmarshal the CSI vault configuration for %q: %w", k, err)
 	}
 
-	return sv, nil
+	return jsonMap, nil
 }
 
 // dataToMap converts a json blob containing Vault configuration options to a map.

@@ -21,6 +21,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 func TestParseConfig(t *testing.T) {
@@ -215,5 +217,79 @@ func TestDataToMap(t *testing.T) {
 		if optionsMap[k] != v {
 			t.Errorf("option %q does not match %q (expected %q)", k, v, optionsMap[k])
 		}
+	}
+}
+
+// TestCMToConfig creates a Kubernetes Secret in the form the OCS Console does,
+// and then parses it in a similar way to GetKMS()/getVaultConfiguration().
+func TestCMToConfig(t *testing.T) {
+	cm := corev1.ConfigMap{}
+	config := make(map[string]interface{})
+
+	cm.Data = make(map[string]string)
+	cm.Data["1-vault"] = `{
+		"KMS_PROVIDER":"vaulttokens",
+		"KMS_SERVICE_NAME":"vault",
+		"VAULT_ADDR":"https://vault.qe.rh-ocs.com:8200",
+		"VAULT_BACKEND_PATH":"rbd-encryption",
+		"VAULT_CACERT":"ocs-kms-ca-secret-cp6wg",
+		"VAULT_TLS_SERVER_NAME":"",
+		"VAULT_CLIENT_CERT":"ocs-kms-client-cert-fgzc3o",
+		"VAULT_CLIENT_KEY":"ocs-kms-client-key-9f8kj",
+		"VAULT_NAMESPACE":"ocs/rbd",
+		"VAULT_TOKEN_NAME":"ocs-kms-token",
+		"VAULT_CACERT_FILE":"fullchain.pem",
+		"VAULT_CLIENT_CERT_FILE":"cert.pem",
+		"VAULT_CLIENT_KEY_FILE":"privkey.pem"
+	}`
+	cm.Data["manual-added-vault"] = `{
+		"encryptionKMSType": "vault",
+		"vaultAddress": "http://vault.default.svc.cluster.local:8200",
+		"vaultAuthPath": "/v1/auth/kubernetes/login",
+		"vaultRole": "csi-kubernetes",
+		"vaultPassphraseRoot": "/v1/secret",
+		"vaultPassphrasePath": "ceph-csi/",
+		"vaultCAVerify": "false"
+	}`
+
+	for k, v := range cm.Data {
+		// inspect the type of configuration
+		ch, err := kmsConfigHeaderNew(v)
+		if err != nil {
+			t.Errorf("failed to detect provider type for %q: %w", k, err)
+		}
+		if ch.isVaultTokensConfigMap() {
+			sv, err := dataToStandardVault(k, v)
+			if err != nil {
+				t.Errorf("could not parse Vault config for %q: %w", k, err)
+			}
+			config[k] = sv
+		} else {
+			options, err := dataToMap(v)
+			if err != nil {
+				t.Errorf("could not parse options for %q: %w", k, err)
+			}
+			config[k] = options
+		}
+	}
+
+	kmsConfig, ok := config["1-vault"]
+	if !ok {
+		t.Errorf("failed to get %q from map: %v", "1-vault", config)
+	}
+
+	_, ok = kmsConfig.(map[string]interface{})
+	if !ok {
+		t.Errorf("failed to convert %T: %v", kmsConfig, kmsConfig)
+	}
+
+	kmsConfig, ok = config["manual-added-vault"]
+	if !ok {
+		t.Errorf("failed to get %q from map: %v", "manual-added-vault", config)
+	}
+
+	_, ok = kmsConfig.(map[string]interface{})
+	if !ok {
+		t.Errorf("failed to convert %T: %v", kmsConfig, kmsConfig)
 	}
 }

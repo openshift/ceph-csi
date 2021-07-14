@@ -152,9 +152,14 @@ func GetKMS(tenant, kmsID string, secrets map[string]string) (EncryptionKMS, err
 		}
 	}
 
-	kmsConfig, ok := config[kmsID].(map[string]interface{})
+	kmsMap, ok := config[kmsID]
 	if !ok {
-		return nil, fmt.Errorf("missing encryption KMS configuration with %s", kmsID)
+		return nil, fmt.Errorf("missing encryption KMS configuration with %q", kmsID)
+	}
+
+	kmsConfig, ok := kmsMap.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("failed to convert encryption KMS configuration %q", kmsID)
 	}
 
 	kmsType, ok := kmsConfig[kmsTypeKey]
